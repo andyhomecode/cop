@@ -1,5 +1,7 @@
 # cop — Security Monitoring Daemon
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
 A Python daemon that actively monitors a Linux machine for signs of compromise: unexpected processes, new listening ports, sensitive file changes, Docker anomalies, SSH brute-force, and resource abuse. Alerts are delivered via [ntfy.sh](https://ntfy.sh) and/or Telegram (with two-way reply support).
 
 ## Architecture
@@ -527,3 +529,7 @@ docker pull alpine:latest
 **Adding a new monitor:** subclass `BaseMonitor` (`cop/monitors/base.py`), implement `run()` and `learn()`, register in `cop/main.py:build_monitors()`.
 
 **Adding a new alert sink:** subclass `AlertSink` (`cop/sinks/base.py`), implement `send()` and `close()`, add to the sinks list in `cop/main.py:run_daemon()`.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
