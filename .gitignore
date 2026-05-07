@@ -1,0 +1,26 @@
+# Python
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# pytest
+.pytest_cache/
+
+# Runtime data (baseline DB and alert log)
+*.db
+*.jsonl
+
+# Claude Code session state — contains local paths
+.claude/settings.local.json
+
+# Local config with real topic names/tokens — never commit
+config.yaml
+/root/.config/cop/
+
+# Local repo notes
+publicrepo.md

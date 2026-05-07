@@ -1,0 +1,154 @@
+# cop configuration
+# Copy to /root/.config/cop/config.yaml and edit as needed (cop runs as root).
+# All fields are optional — omitted fields use the built-in defaults.
+
+general:
+  data_dir: "~/.local/share/cop"       # baseline DB + alert log live here
+  log_level: "INFO"                     # DEBUG / INFO / WARNING
+  poll_interval_seconds: 30             # how often process + network monitors poll
+
+alerts:
+  dedup_window_seconds: 300             # suppress identical rule_id within this window
+  rule_cooldowns:                       # per-rule overrides (seconds)
+    new_root_process: 600
+    new_listen_port: 3600
+    ssh_brute_force: 60
+    crypto_cpu: 300
+
+ntfy:
+  enabled: true
+  url: "https://ntfy.sh/your-cop-topic"
+  token: ""                             # set to Bearer token if topic is access-controlled
+  timeout_seconds: 10
+
+log_sink:
+  enabled: true
+  path: "~/.local/share/cop/alerts.jsonl"
+  max_bytes: 10485760                   # 10 MB before rotation
+  backup_count: 3
+
+ollama:
+  enabled: false                        # set true to score every alert via local Ollama
+  url: "http://localhost:11434/api/generate"
+  model: "qwen3:1.7b"
+  timeout_seconds: 30                   # per-request timeout; alerts fire even if Ollama is slow
+  history_count: 10                     # events fed to /assessment and used as scoring context
+
+telegram:
+  enabled: false
+  bot_token: ""                         # from @BotFather
+  chat_id: ""                           # your personal or group chat ID
+  allowed_user_ids: []                  # Telegram user IDs allowed to issue commands (empty = allow all)
+  allowed_commands:                     # prefix whitelist for /exec
+    - "docker stop"
+    - "docker restart"
+    - "systemctl stop"
+    - "kill"
+  confirm_destructive: true             # require "YES" before /exec runs
+
+monitors:
+  process:
+    enabled: true
+    # Shells spawned by these parents trigger CRITICAL suspicious_shell_spawn
+    suspicious_parent_names:
+      - caddy
+      - python3
+      - node
+    shell_names:
+      - bash
+      - sh
+      - zsh
+      - dash
+      - fish
+    # Short-lived cron/daemon processes that won't be running during 'cop learn'
+    ignored_process_names: []
+    # Examples:
+    #   - my-cron-job     # runs briefly at night
+    #   - snapshotd       # btrfs snapshot daemon
+
+  network:
+    enabled: true
+    # Ports to treat as always-known (never fire new_listen_port for these)
+    baseline_ports_override: []
+    # Window (seconds) over which outbound bytes are summed for data_volume_anomaly
+    data_volume_window_seconds: 60
+    # Outbound data rate that triggers data_volume_anomaly (MB/min)
+    data_volume_threshold_mb: 100
+    # Outbound connections to these CIDRs are not flagged
+    trusted_cidrs:
+      - "127.0.0.0/8"
+      - "::1/128"
+      - "100.64.0.0/10"    # Tailscale CGNAT
+      - "192.168.0.0/16"
+      - "10.0.0.0/8"
+    trusted_process_names:
+      - tailscaled
+      - systemd-resolved
+
+  file:
+    enabled: true
+    watch_paths:
+      - "~/.ssh"
+      - "/etc"
+      - "/home"
+      - "/var/run/docker.sock"
+      # Add additional paths as needed:
+      # - "/mnt/data/Dropbox"
+    ignore_patterns:                       # matched against filename only
+      - "*.swp"
+      - "*.tmp"
+      - "*~"
+      - ".dropbox"
+      - "*.pyc"
+    ignore_paths:                          # matched as path prefixes (full path)
+      []
+      # Examples:
+      # - "/mnt/data/Dropbox/.dropbox.cache"
+      # - "/etc/cups"
+    alert_on_events:
+      - created
+      - modified
+      - deleted
+      - moved
+    # Any write to these paths fires CRITICAL instead of WARN
+    critical_paths:
+      - "~/.ssh/authorized_keys"
+      - "/etc/passwd"
+      - "/etc/shadow"
+      - "/etc/sudoers"
+      - "/etc/ssh/sshd_config"
+
+  docker:
+    enabled: true
+    socket_path: "/var/run/docker.sock"
+    # Containers expected to run — any other name on start fires WARN
+    # Run 'cop baseline show --table containers' to see current containers
+    known_containers: []
+    restart_count_threshold: 3          # restarts within window before WARN
+    restart_window_seconds: 300
+
+  auth:
+    enabled: true
+    log_path: "/var/log/auth.log"
+    brute_force_threshold: 5            # failures from same IP within window -> CRITICAL
+    brute_force_window_seconds: 60
+    # SSH logins from IPs outside these sources fire WARN ssh_unknown_source
+    known_ssh_sources:
+      - "100.64.0.0/10"                 # Tailscale
+      - "127.0.0.1"
+    known_sudo_users:
+      - root
+      # - youruser
+
+  resource:
+    enabled: true
+    cpu_threshold_percent: 90.0         # per-process CPU % to trigger check
+    cpu_sustained_seconds: 120          # must be sustained this long before alerting
+    memory_threshold_percent: 85.0      # system-wide memory %
+    net_send_threshold_mbps: 50.0       # system-wide send rate
+    net_recv_threshold_mbps: 100.0      # system-wide recv rate
+    check_interval_seconds: 15
+    resource_whitelist: []              # never alert on these process names
+    # Examples:
+    #   - dropbox
+    #   - mybackupjob

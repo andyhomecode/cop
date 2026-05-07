@@ -1,0 +1,28 @@
+[Unit]
+Description=cop security monitoring daemon
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+
+ExecStart=/usr/local/bin/cop run
+ExecReload=/bin/kill -HUP $MAINPID
+
+Restart=on-failure
+RestartSec=10
+RestartPreventExitStatus=1
+
+NoNewPrivileges=yes
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=cop
+
+# Override config path if needed:
+# Environment=COP_CONFIG=/etc/cop/config.yaml
+
+[Install]
+WantedBy=multi-user.target
