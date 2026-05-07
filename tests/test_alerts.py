@@ -5,7 +5,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from cop.alerts import Alert, AlertEngine, Severity
+from cop.alerts import Alert, AlertEngine, Severity, _redact
 from cop.config import AlertsConfig
 
 
@@ -45,6 +45,70 @@ def make_alert(rule_id: str = "test_rule", severity: Severity = Severity.WARN) -
         message="Something happened",
         source_monitor="TestMonitor",
     )
+
+
+class TestRedact:
+    def test_bearer_token(self):
+        assert _redact("Authorization: Bearer abc123") == "Authorization: Bearer [REDACTED]"
+
+    def test_basic_auth(self):
+        assert _redact("Authorization: Basic dXNlcjpwYXNz") == "Authorization: Basic [REDACTED]"
+
+    def test_authorization_token(self):
+        assert _redact("Authorization: Token abc123xyz") == "Authorization: Token [REDACTED]"
+
+    def test_url_password(self):
+        assert _redact("postgresql://user:s3cr3t@localhost/db") == "postgresql://user:[REDACTED]@localhost/db"
+
+    def test_password_equals(self):
+        assert _redact("password=hunter2") == "password=[REDACTED]"
+
+    def test_passwd_equals(self):
+        assert _redact("passwd=hunter2") == "passwd=[REDACTED]"
+
+    def test_secret_equals(self):
+        assert _redact("secret=topsecret") == "secret=[REDACTED]"
+
+    def test_token_equals(self):
+        assert _redact("GITHUB_TOKEN=ghp_abcdef") == "GITHUB_TOKEN=[REDACTED]"
+
+    def test_api_key(self):
+        assert _redact("api_key=abc123") == "api_key=[REDACTED]"
+
+    def test_api_dash_key(self):
+        assert _redact("api-key=abc123") == "api-key=[REDACTED]"
+
+    def test_access_token(self):
+        assert _redact("access_token=abc123") == "access_token=[REDACTED]"
+
+    def test_flag_password_space(self):
+        assert _redact("mysql --password hunter2 --host localhost") == "mysql --password [REDACTED] --host localhost"
+
+    def test_flag_passwd_space(self):
+        assert _redact("mysqldump --passwd secret123") == "mysqldump --passwd [REDACTED]"
+
+    def test_pem_private_key(self):
+        text = "-----BEGIN RSA PRIVATE KEY-----\nMIIEpAIBAAK\n-----END RSA PRIVATE KEY-----"
+        result = _redact(text)
+        assert "MIIEpAIBAAK" not in result
+        assert "-----BEGIN RSA PRIVATE KEY-----" in result
+        assert "-----END RSA PRIVATE KEY-----" in result
+
+    def test_no_false_positive_on_plain_text(self):
+        text = "process started with pid 1234"
+        assert _redact(text) == text
+
+    def test_context_is_redacted_in_alert(self):
+        alert = Alert(
+            rule_id="test", severity=Severity.WARN, title="test",
+            message="curl -H 'Authorization: Bearer secrettoken'",
+            source_monitor="test",
+            context={"cmdline": "curl --password hunter2 https://example.com"},
+        )
+        from cop.alerts import _redact_alert
+        _redact_alert(alert)
+        assert "secrettoken" not in alert.message
+        assert "hunter2" not in alert.context["cmdline"]
 
 
 @pytest.mark.asyncio

@@ -17,11 +17,28 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger("cop.alerts")
 
-_BEARER_RE = re.compile(r"(Bearer\s+)[A-Za-z0-9\-_\.~\+\/]+=*", re.IGNORECASE)
+_REDACT_PATTERNS: list[tuple[re.Pattern, str]] = [
+    # HTTP Authorization header values
+    (re.compile(r"(Bearer\s+)[A-Za-z0-9\-_\.~\+\/]+=*", re.IGNORECASE), r"\1[REDACTED]"),
+    (re.compile(r"(Basic\s+)[A-Za-z0-9+/]+=*", re.IGNORECASE), r"\1[REDACTED]"),
+    (re.compile(r"(Authorization:\s*Token\s+)\S+", re.IGNORECASE), r"\1[REDACTED]"),
+    # Credentials embedded in URLs: proto://user:pass@host
+    (re.compile(r"(://[^:@\s/]+:)[^@\s/]+(?=@)"), r"\1[REDACTED]"),
+    # Key=value or key: value for common secret field names
+    (re.compile(
+        r"(?i)((?:password|passwd|secret|token|api[-_]?key|access[_-]?token|auth[_-]?token|private[_-]?key)\s*[=:]\s*)\S+",
+    ), r"\1[REDACTED]"),
+    # --password/--passwd/--secret/--token <space-separated value>
+    (re.compile(r"(?i)(--(?:password|passwd|secret|token)\s+)\S+"), r"\1[REDACTED]"),
+    # PEM private key blocks
+    (re.compile(r"(-----BEGIN [A-Z ]*PRIVATE KEY-----).+?(-----END [A-Z ]*PRIVATE KEY-----)", re.DOTALL), r"\1[REDACTED]\2"),
+]
 
 
 def _redact(text: str) -> str:
-    return _BEARER_RE.sub(r"\1[REDACTED]", text)
+    for pattern, replacement in _REDACT_PATTERNS:
+        text = pattern.sub(replacement, text)
+    return text
 
 
 def _redact_alert(alert: Alert) -> None:
