@@ -6,7 +6,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from cop.alerts import Alert, AlertEngine, Severity, _redact
-from cop.config import AlertsConfig
+from cop.config import AlertsConfig, OllamaConfig
 
 
 @pytest.fixture
@@ -164,3 +164,131 @@ async def test_alert_recorded_even_when_deduped(engine, mock_db):
     call_args = mock_db.record_alert.call_args_list[1]
     # deduped is the 9th positional arg
     assert call_args.kwargs.get("deduped", call_args.args[8] if len(call_args.args) > 8 else None)
+
+
+def make_scorer():
+    """Minimal fake scorer — fire() only calls score() when scorer is not None."""
+    scorer = AsyncMock()
+    scorer.score = AsyncMock(return_value=(7, "suspicious activity"))
+    return scorer
+
+
+def make_ollama_engine(config, mock_db, mock_sink, ollama_cfg: OllamaConfig):
+    scorer = make_scorer()
+    return AlertEngine(config, mock_db, [mock_sink], scorer=scorer, ollama_config=ollama_cfg), scorer
+
+
+class TestIsOllamaSuppressed:
+    def _engine(self, config, mock_db, mock_sink, ollama_cfg):
+        scorer = make_scorer()
+        return AlertEngine(config, mock_db, [mock_sink], scorer=scorer, ollama_config=ollama_cfg)
+
+    def _alert(self, risk, comment):
+        a = make_alert()
+        a.context["ollama_risk"] = risk
+        a.context["ollama_comment"] = comment
+        return a
+
+    def test_no_suppression_without_ollama_config(self, config, mock_db, mock_sink):
+        engine = AlertEngine(config, mock_db, [mock_sink], scorer=make_scorer(), ollama_config=None)
+        assert engine._is_ollama_suppressed(self._alert(2, "routine")) is False
+
+    def test_no_suppression_without_scorer(self, config, mock_db, mock_sink):
+        ollama_cfg = OllamaConfig(min_risk=5)
+        engine = AlertEngine(config, mock_db, [mock_sink], scorer=None, ollama_config=ollama_cfg)
+        assert engine._is_ollama_suppressed(self._alert(2, "routine")) is False
+
+    def test_risk_below_threshold_suppressed(self, config, mock_db, mock_sink):
+        engine = self._engine(config, mock_db, mock_sink, OllamaConfig(min_risk=5))
+        assert engine._is_ollama_suppressed(self._alert(4, "looks fine")) is True
+
+    def test_risk_at_threshold_not_suppressed(self, config, mock_db, mock_sink):
+        engine = self._engine(config, mock_db, mock_sink, OllamaConfig(min_risk=5))
+        assert engine._is_ollama_suppressed(self._alert(5, "looks fine")) is False
+
+    def test_risk_above_threshold_not_suppressed(self, config, mock_db, mock_sink):
+        engine = self._engine(config, mock_db, mock_sink, OllamaConfig(min_risk=5))
+        assert engine._is_ollama_suppressed(self._alert(8, "looks fine")) is False
+
+    def test_min_risk_zero_disables_risk_filter(self, config, mock_db, mock_sink):
+        engine = self._engine(config, mock_db, mock_sink, OllamaConfig(min_risk=0))
+        assert engine._is_ollama_suppressed(self._alert(0, "looks fine")) is False
+
+    def test_comment_pattern_match_suppressed(self, config, mock_db, mock_sink):
+        cfg = OllamaConfig(suppressed_comment_patterns=["routine"])
+        engine = self._engine(config, mock_db, mock_sink, cfg)
+        assert engine._is_ollama_suppressed(self._alert(8, "routine package update")) is True
+
+    def test_comment_pattern_case_insensitive(self, config, mock_db, mock_sink):
+        cfg = OllamaConfig(suppressed_comment_patterns=["legitimate"])
+        engine = self._engine(config, mock_db, mock_sink, cfg)
+        assert engine._is_ollama_suppressed(self._alert(8, "LEGITIMATE admin action")) is True
+
+    def test_comment_no_match_not_suppressed(self, config, mock_db, mock_sink):
+        cfg = OllamaConfig(suppressed_comment_patterns=["routine", "legitimate"])
+        engine = self._engine(config, mock_db, mock_sink, cfg)
+        assert engine._is_ollama_suppressed(self._alert(8, "suspicious outbound connection")) is False
+
+    def test_comment_multi_word_phrase(self, config, mock_db, mock_sink):
+        cfg = OllamaConfig(suppressed_comment_patterns=["no malicious indicators"])
+        engine = self._engine(config, mock_db, mock_sink, cfg)
+        assert engine._is_ollama_suppressed(self._alert(3, "no malicious indicators found")) is True
+
+    def test_both_filters_either_suppresses(self, config, mock_db, mock_sink):
+        # High risk but matching comment → suppressed by comment pattern
+        cfg = OllamaConfig(min_risk=5, suppressed_comment_patterns=["routine"])
+        engine = self._engine(config, mock_db, mock_sink, cfg)
+        assert engine._is_ollama_suppressed(self._alert(9, "routine maintenance")) is True
+
+    def test_regex_pattern_supported(self, config, mock_db, mock_sink):
+        cfg = OllamaConfig(suppressed_comment_patterns=[r"routine|legitimate"])
+        engine = self._engine(config, mock_db, mock_sink, cfg)
+        assert engine._is_ollama_suppressed(self._alert(6, "legitimate admin task")) is True
+
+
+class TestOllamaSuppressionDispatch:
+    @pytest.mark.asyncio
+    async def test_suppressed_alert_does_not_reach_sink(self, config, mock_db, mock_sink):
+        cfg = OllamaConfig(min_risk=5)
+        engine, scorer = make_ollama_engine(config, mock_db, mock_sink, cfg)
+        scorer.score.return_value = (2, "low risk activity")
+
+        fired = await engine.fire(make_alert())
+
+        assert fired is False
+        mock_sink.send.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_suppressed_alert_still_recorded_to_db(self, config, mock_db, mock_sink):
+        cfg = OllamaConfig(min_risk=5)
+        engine, scorer = make_ollama_engine(config, mock_db, mock_sink, cfg)
+        scorer.score.return_value = (2, "low risk activity")
+
+        await engine.fire(make_alert())
+
+        mock_db.record_alert.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_non_suppressed_alert_reaches_sink(self, config, mock_db, mock_sink):
+        cfg = OllamaConfig(min_risk=5)
+        engine, scorer = make_ollama_engine(config, mock_db, mock_sink, cfg)
+        scorer.score.return_value = (7, "suspicious activity")
+
+        fired = await engine.fire(make_alert())
+
+        assert fired is True
+        mock_sink.send.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_suppressed_alert_updates_dedup_window(self, config, mock_db, mock_sink):
+        # A suppressed alert should still advance _last_fired so the next
+        # identical event within the cooldown is deduped (not re-scored).
+        cfg = OllamaConfig(min_risk=5)
+        engine, scorer = make_ollama_engine(config, mock_db, mock_sink, cfg)
+        scorer.score.return_value = (2, "low risk")
+
+        await engine.fire(make_alert("test_rule"))
+        # Second identical alert within window — should be deduped, not scored again
+        await engine.fire(make_alert("test_rule"))
+
+        assert scorer.score.call_count == 1  # only scored once

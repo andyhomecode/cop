@@ -97,7 +97,7 @@ async def run_daemon(config: CopConfig) -> None:
                 sinks.append(telegram_sink)
 
             scorer = OllamaScorer(config.ollama, session, data_dir=config.data_path) if config.ollama.enabled else None
-            engine = AlertEngine(config.alerts, db, sinks, scorer=scorer)
+            engine = AlertEngine(config.alerts, db, sinks, scorer=scorer, ollama_config=config.ollama if scorer else None)
             monitors = build_monitors(config, db, engine)
 
             if telegram_sink is not None:

@@ -201,6 +201,8 @@ class OllamaConfig:
     model: str = "qwen3:1.7b"
     timeout_seconds: int = 60
     history_count: int = 10
+    min_risk: int = 0
+    suppressed_comment_patterns: list[str] = field(default_factory=list)
 
 
 @dataclass

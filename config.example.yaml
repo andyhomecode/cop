@@ -33,6 +33,11 @@ ollama:
   model: "qwen3:1.7b"
   timeout_seconds: 30                   # per-request timeout; alerts fire even if Ollama is slow
   history_count: 10                     # events fed to /assessment and used as scoring context
+  min_risk: 5                           # suppress dispatch for alerts scored below this (0 = disabled)
+  suppressed_comment_patterns:          # suppress dispatch if comment matches any pattern (case-insensitive regex)
+    - "routine"
+    - "legitimate"
+    - "no malicious indicators"
 
 telegram:
   enabled: false

@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from cop.baseline import BaselineDB
-    from cop.config import AlertsConfig
+    from cop.config import AlertsConfig, OllamaConfig
     from cop.ollama import OllamaScorer
     from cop.sinks.base import AlertSink
 
@@ -73,31 +73,54 @@ class AlertEngine:
         db: BaselineDB,
         sinks: list[AlertSink],
         scorer: OllamaScorer | None = None,
+        ollama_config: OllamaConfig | None = None,
     ):
         self._config = config
         self._db = db
         self._sinks = sinks
         self._scorer = scorer
+        self._ollama_config = ollama_config
         self._last_fired: dict[str, datetime] = {}
         self._lock = asyncio.Lock()
 
     async def fire(self, alert: Alert) -> bool:
-        """Check dedup, record to DB, dispatch to sinks. Returns True if alert was sent."""
+        """Check dedup, score, apply filters, record to DB, dispatch to sinks. Returns True if dispatched."""
         async with self._lock:
             _redact_alert(alert)
             deduped = self._is_duplicate(alert)
             sent_ntfy = False
+            dispatched = False
             if not deduped:
                 if self._scorer is not None:
                     risk, comment = await self._scorer.score(alert)
                     alert.context["ollama_risk"] = risk
                     alert.context["ollama_comment"] = comment
-                sent_ntfy = await self._dispatch(alert)
                 self._last_fired[alert.rule_id] = alert.fired_at
+                if self._is_ollama_suppressed(alert):
+                    logger.debug(
+                        "[suppressed] %s — risk=%s %s",
+                        alert.rule_id,
+                        alert.context.get("ollama_risk"),
+                        alert.context.get("ollama_comment", ""),
+                    )
+                else:
+                    sent_ntfy = await self._dispatch(alert)
+                    dispatched = True
+                    logger.info("[%s] %s — %s", alert.severity.value, alert.rule_id, alert.title)
             await self._record(alert, deduped=deduped, sent_ntfy=sent_ntfy)
-            if not deduped:
-                logger.info("[%s] %s — %s", alert.severity.value, alert.rule_id, alert.title)
-            return not deduped
+            return dispatched
+
+    def _is_ollama_suppressed(self, alert: Alert) -> bool:
+        if self._ollama_config is None or self._scorer is None:
+            return False
+        risk = alert.context.get("ollama_risk", 0)
+        comment = alert.context.get("ollama_comment", "")
+        if self._ollama_config.min_risk > 0 and risk < self._ollama_config.min_risk:
+            return True
+        for pattern in self._ollama_config.suppressed_comment_patterns:
+            if re.search(pattern, comment, re.IGNORECASE):
+                return True
+        return False
 
     def _is_duplicate(self, alert: Alert) -> bool:
         last = self._last_fired.get(alert.rule_id)

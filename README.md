@@ -91,6 +91,8 @@ Key settings to review:
 | `ollama.url` | `http://localhost:11434/api/generate` | Ollama generate endpoint |
 | `ollama.model` | `qwen3:1.7b` | Model to use (must be pulled in Ollama) |
 | `ollama.timeout_seconds` | `60` | Per-request timeout; alerts fire even if Ollama is slow/down |
+| `ollama.min_risk` | `0` | Suppress dispatch for alerts scored below this level; `0` disables the filter |
+| `ollama.suppressed_comment_patterns` | `[]` | Suppress dispatch if Ollama comment matches any of these case-insensitive regex patterns |
 | `telegram.enabled` | `false` | Enable Telegram bot sink |
 | `telegram.bot_token` | `""` | From @BotFather |
 | `telegram.chat_id` | `""` | Your personal or group chat ID (see below) |
@@ -202,6 +204,27 @@ Requires Ollama running locally with the configured model pulled:
 ```bash
 ollama pull qwen3:1.7b
 ```
+
+### Suppression filters
+
+Two optional filters can prevent low-signal alerts from reaching your sinks. Suppressed alerts are still recorded to the SQLite DB and `alerts.jsonl` for audit purposes — only the dispatch to ntfy, Telegram, and the log sink is skipped.
+
+**Risk threshold** — set `min_risk` to drop any alert scored below that level:
+```yaml
+ollama:
+  min_risk: 5   # discard risk 0–4; dispatch risk 5–10
+```
+
+**Comment patterns** — set `suppressed_comment_patterns` to a list of case-insensitive regex patterns; if the model's comment matches any of them the alert is suppressed:
+```yaml
+ollama:
+  suppressed_comment_patterns:
+    - "routine"
+    - "legitimate"
+    - "no malicious indicators"
+```
+
+Both filters are independent and either one alone can suppress an alert. If Ollama is unreachable (`ollama_comment: "Ollama Down"`), a `min_risk > 0` filter will suppress those alerts too since the fallback risk is `0` — set `min_risk: 0` to disable the filter if you want alerts to fire even when Ollama is down.
 
 ### ntfy priority mapping
 
