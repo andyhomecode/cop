@@ -147,7 +147,10 @@ Tails `/var/log/dpkg.log` from the end (does not replay history on startup). On 
 Tails `/var/log/kern.log` and matches `module loaded` log lines. On startup, runs `lsmod` and seeds all currently-loaded modules as known — so only modules loaded *after* cop starts will fire `kernel_module_loaded`. Add frequently-loaded modules (e.g. from a kernel update) to `monitors.kernel.known_modules` to suppress expected loads.
 
 ### TripwireMonitor
-Places inotify `IN_ACCESS` watches on a list of honeypot files — files that no legitimate process should ever open. Any read fires an immediate CRITICAL alert. On startup, files that don't exist are created as empty decoys when `create_missing: true` (the default). The alert includes a best-effort process attribution by scanning `/proc/*/fd` for the accessing process at the moment the event fires.
+
+> **⚠️ Not working yet.** File-open detection via watchdog is currently unreliable — alerts are not firing as expected. This monitor is disabled pending a fix.
+
+Places inotify watches on a list of honeypot files — files that no legitimate process should ever open. Any read fires an immediate CRITICAL alert. On startup, files that don't exist are created as empty decoys when `create_missing: true` (the default). The alert includes a best-effort process attribution by scanning `/proc/*/fd` for the accessing process at the moment the event fires.
 
 Good candidates are files that attackers commonly grep for but that don't exist on a typical server: `/root/.aws/credentials`, `/root/.gnupg/secring.gpg`, `/root/.netrc`. Only add real files (e.g. `/root/.ssh/id_rsa`) if you are certain no legitimate tool reads them — backup agents and ssh-agents do.
 
@@ -524,6 +527,8 @@ sudo modprobe -r dummy
 ```
 
 ### TripwireMonitor
+
+> **⚠️ Not working yet** — alerts are not firing reliably.
 
 **`tripwire_<filename>` (CRITICAL)** — read any honeypot file; detected immediately:
 ```bash

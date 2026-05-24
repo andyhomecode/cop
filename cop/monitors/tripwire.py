@@ -27,7 +27,7 @@ class _TripwireEventHandler(FileSystemEventHandler):
     def on_any_event(self, event: FileSystemEvent) -> None:
         if event.is_directory:
             return
-        if event.event_type != "accessed":
+        if event.event_type != "opened":
             return
         src = str(event.src_path)
         if src not in self._tripwire_paths:
@@ -118,7 +118,7 @@ class TripwireMonitor(BaseMonitor):
             rule_id=f"tripwire_{name}",
             severity=Severity.CRITICAL,
             title=f"Tripwire: {name} accessed{proc_str}",
-            message=f"Honeypot file was read{proc_str}: {path}",
+            message=f"Honeypot file was opened{proc_str}: {path}",
             source_monitor=self.name,
             context=context,
         ))
