@@ -175,6 +175,20 @@ class KernelMonitorConfig:
 
 
 @dataclass
+class TripwireMonitorConfig:
+    enabled: bool = True
+    files: list[str] = field(
+        default_factory=lambda: [
+            "/root/.aws/credentials",
+            "/root/.gnupg/secring.gpg",
+            "/root/.netrc",
+        ]
+    )
+    # Create empty decoy files for entries that don't already exist
+    create_missing: bool = True
+
+
+@dataclass
 class MonitorsConfig:
     process: ProcessMonitorConfig = field(default_factory=ProcessMonitorConfig)
     network: NetworkMonitorConfig = field(default_factory=NetworkMonitorConfig)
@@ -185,6 +199,7 @@ class MonitorsConfig:
     persistence: PersistenceMonitorConfig = field(default_factory=PersistenceMonitorConfig)
     package: PackageMonitorConfig = field(default_factory=PackageMonitorConfig)
     kernel: KernelMonitorConfig = field(default_factory=KernelMonitorConfig)
+    tripwire: TripwireMonitorConfig = field(default_factory=TripwireMonitorConfig)
 
 
 @dataclass
@@ -309,6 +324,8 @@ def _build_config(raw: dict[str, Any]) -> CopConfig:
             monitors.package = _apply(PackageMonitorConfig(), m["package"])
         if "kernel" in m:
             monitors.kernel = _apply(KernelMonitorConfig(), m["kernel"])
+        if "tripwire" in m:
+            monitors.tripwire = _apply(TripwireMonitorConfig(), m["tripwire"])
         config.monitors = monitors
     return config
 

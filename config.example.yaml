@@ -145,6 +145,21 @@ monitors:
       - root
       # - youruser
 
+  tripwire:
+    enabled: true
+    # Honeypot files — any read access fires an immediate CRITICAL alert.
+    # These should be files no legitimate process will ever open on your system.
+    files:
+      - "/root/.aws/credentials"        # AWS credential grab
+      - "/root/.gnupg/secring.gpg"      # Legacy GPG private key (rarely exists)
+      - "/root/.netrc"                   # Plaintext FTP/HTTP credentials
+      # Other good candidates:
+      # - "/root/.ssh/id_rsa"           # Only add if you don't actually use this key
+      # - "/root/.docker/config.json"   # Docker Hub auth token
+      # - "/var/www/html/wp-config.php" # WordPress DB credentials
+      # - "/opt/app/.env"               # App secrets (adjust to your stack)
+    create_missing: true                # Create empty decoy files that don't already exist
+
   resource:
     enabled: true
     cpu_threshold_percent: 90.0         # per-process CPU % to trigger check

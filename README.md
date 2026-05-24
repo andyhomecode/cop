@@ -2,7 +2,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-A Python daemon that actively monitors a Linux machine for signs of compromise: unexpected processes, new listening ports, sensitive file changes, Docker anomalies, SSH brute-force, and resource abuse. Alerts are delivered via [ntfy.sh](https://ntfy.sh) and/or Telegram (with two-way reply support).
+A Python daemon that actively monitors a Linux machine for signs of compromise: unexpected processes, new listening ports, sensitive file changes, honeypot tripwires, Docker anomalies, SSH brute-force, and resource abuse. Alerts are delivered via [ntfy.sh](https://ntfy.sh) and/or Telegram (with two-way reply support).
 
 ## Architecture
 
@@ -16,7 +16,8 @@ cop daemon (asyncio)
 ├── ResourceMonitor     — sustained CPU spikes, memory, network bandwidth
 ├── PersistenceMonitor  — new cron jobs and systemd units (common persistence vectors)
 ├── PackageMonitor      — tail /var/log/dpkg.log for installs/removals
-└── KernelMonitor       — tail /var/log/kern.log for unexpected module loads
+├── KernelMonitor       — tail /var/log/kern.log for unexpected module loads
+└── TripwireMonitor     — inotify IN_ACCESS on honeypot files; fires on any read
 
 Alert flow: monitor → AlertEngine (redact secrets → dedup + cooldown) → [Ollama scorer] → ntfy.sh + Telegram + alerts.jsonl
 State: SQLite at ~/.local/share/cop/baseline.db (when run as root)
@@ -83,6 +84,8 @@ Key settings to review:
 | `monitors.package.ignored_packages` | `[]` | Package names to suppress entirely |
 | `monitors.kernel.log_path` | `/var/log/kern.log` | Path to kernel log |
 | `monitors.kernel.known_modules` | `[]` | Module names pre-approved beyond what `lsmod` seeds at startup |
+| `monitors.tripwire.files` | (see below) | Honeypot file paths — any read access fires CRITICAL |
+| `monitors.tripwire.create_missing` | `true` | Create empty decoy files for entries that don't already exist |
 | `monitors.docker.socket_path` | `/var/run/docker.sock` | Path to Docker socket |
 | `monitors.docker.known_containers` | `[]` | Populate via `cop baseline show --table containers`; update when adding/removing containers |
 | `monitors.auth.known_ssh_sources` | Tailscale CGNAT | Add your usual client IPs |
@@ -143,6 +146,13 @@ Tails `/var/log/dpkg.log` from the end (does not replay history on startup). On 
 ### KernelMonitor
 Tails `/var/log/kern.log` and matches `module loaded` log lines. On startup, runs `lsmod` and seeds all currently-loaded modules as known — so only modules loaded *after* cop starts will fire `kernel_module_loaded`. Add frequently-loaded modules (e.g. from a kernel update) to `monitors.kernel.known_modules` to suppress expected loads.
 
+### TripwireMonitor
+Places inotify `IN_ACCESS` watches on a list of honeypot files — files that no legitimate process should ever open. Any read fires an immediate CRITICAL alert. On startup, files that don't exist are created as empty decoys when `create_missing: true` (the default). The alert includes a best-effort process attribution by scanning `/proc/*/fd` for the accessing process at the moment the event fires.
+
+Good candidates are files that attackers commonly grep for but that don't exist on a typical server: `/root/.aws/credentials`, `/root/.gnupg/secring.gpg`, `/root/.netrc`. Only add real files (e.g. `/root/.ssh/id_rsa`) if you are certain no legitimate tool reads them — backup agents and ssh-agents do.
+
+The `rule_id` is `tripwire_<filename>` (one per file), so dedup and cooldowns are tracked independently per tripwire.
+
 ## Alert Reference
 
 | rule_id | Severity | Monitor | Trigger |
@@ -177,6 +187,7 @@ Tails `/var/log/kern.log` and matches `module loaded` log lines. On startup, run
 | `package_removed` | WARN | Package | Package was removed |
 | `package_upgraded` | INFO | Package | Package was upgraded |
 | `kernel_module_loaded` | CRITICAL | Kernel | Kernel module loaded that was not present at startup |
+| `tripwire_<filename>` | CRITICAL | Tripwire | Honeypot file was read (one rule_id per file) |
 
 ## Secret Redaction
 
@@ -512,6 +523,13 @@ sudo modprobe dummy
 sudo modprobe -r dummy
 ```
 
+### TripwireMonitor
+
+**`tripwire_<filename>` (CRITICAL)** — read any honeypot file; detected immediately:
+```bash
+cat /root/.aws/credentials
+```
+
 ### DockerMonitor
 
 **`docker_exec_into_container` (WARN)**:
@@ -537,12 +555,9 @@ docker pull alpine:latest
 
 ## TODO
 
-- **Credential file read detection** — add inotify `IN_ACCESS` watching on SSH private keys (`~/.ssh/id_rsa`, `~/.ssh/id_ed25519`, etc.) using raw inotify via ctypes in `FileMonitor`. Alert `credential_file_read` CRITICAL when any process reads them. Currently cop is blind to file reads entirely.
 - **Docker image digest tracking** — add `image_digest_baseline` table to SQLite. In `DockerMonitor.learn()`, record the RepoDigest of each running container's image. In `_handle_image_pull()`, compare new digest against baseline and alert `docker_image_digest_changed` WARN on mismatch. Guards against supply-chain compromise via updated images.
-- **Auto Shutdown on Critical** -- add an option to automatically shutdown either most processes, disconnect network, or shutdown the PC on Critical alerts
-- **AI Analysis** ✅ — Ollama scoring implemented; auto-remediation (shutdown, network isolation) not yet wired up.
-- **Docker stats in /health** ✅ — `/health` now includes a 🐳 Containers section showing all running containers sorted by CPU%, with CPU%, memory usage, memory %, and cumulative net I/O.
-- **`/assessment` command** ✅ — Telegram command that synthesizes health snapshot + `context.md` + last N alert events into a free-text Ollama situational assessment with an overall risk verdict.
+- **Auto Shutdown on Critical** — add an option to automatically shutdown either most processes, disconnect network, or shutdown the PC on Critical alerts.
+- **Whitelist for busy containers** — add a whitelist for known busy containers so they don't alert on expected network traffic.
 
 
 

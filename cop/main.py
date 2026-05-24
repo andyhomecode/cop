@@ -15,6 +15,7 @@ from cop.monitors.auth import AuthMonitor
 from cop.monitors.docker_ import DockerMonitor
 from cop.monitors.file import FileMonitor
 from cop.monitors.kernel import KernelMonitor
+from cop.monitors.tripwire import TripwireMonitor
 from cop.monitors.network import NetworkMonitor
 from cop.monitors.package import PackageMonitor
 from cop.monitors.persistence import PersistenceMonitor
@@ -74,6 +75,8 @@ def build_monitors(config: CopConfig, baseline: BaselineDB, engine: AlertEngine)
         monitors.append(PackageMonitor(m.package, baseline, engine))
     if m.kernel.enabled:
         monitors.append(KernelMonitor(m.kernel, baseline, engine))
+    if m.tripwire.enabled:
+        monitors.append(TripwireMonitor(m.tripwire, baseline, engine))
     return monitors
 
 
