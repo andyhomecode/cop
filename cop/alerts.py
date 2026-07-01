@@ -92,9 +92,13 @@ class AlertEngine:
             dispatched = False
             if not deduped:
                 if self._scorer is not None:
-                    risk, comment = await self._scorer.score(alert)
-                    alert.context["ollama_risk"] = risk
-                    alert.context["ollama_comment"] = comment
+                    result = await self._scorer.score(alert)
+                    if result is not None:
+                        risk, comment = result
+                        alert.context["ollama_risk"] = risk
+                        alert.context["ollama_comment"] = comment
+                    else:
+                        alert.context["ollama_comment"] = "Ollama Down"
                 self._last_fired[alert.rule_id] = alert.fired_at
                 if self._is_ollama_suppressed(alert):
                     logger.debug(
@@ -113,7 +117,11 @@ class AlertEngine:
     def _is_ollama_suppressed(self, alert: Alert) -> bool:
         if self._ollama_config is None or self._scorer is None:
             return False
-        risk = alert.context.get("ollama_risk", 0)
+        if "ollama_risk" not in alert.context:
+            # Scoring failed (Ollama down/timeout) — fail open rather than
+            # treating "unscored" the same as "scored low risk".
+            return False
+        risk = alert.context["ollama_risk"]
         comment = alert.context.get("ollama_comment", "")
         if self._ollama_config.min_risk > 0 and risk < self._ollama_config.min_risk:
             return True

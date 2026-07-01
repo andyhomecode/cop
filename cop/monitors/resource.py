@@ -171,12 +171,12 @@ class ResourceMonitor(BaseMonitor):
 
     def _calc_net_rates(self) -> tuple[float, float]:
         now = time.monotonic()
-        counters = psutil.net_io_counters()
+        counters = self._external_net_io_counters()
         if self._prev_net_io and self._prev_net_time:
             elapsed = now - self._prev_net_time
             if elapsed > 0:
-                sent_b = counters.bytes_sent - self._prev_net_io.bytes_sent
-                recv_b = counters.bytes_recv - self._prev_net_io.bytes_recv
+                sent_b = counters[0] - self._prev_net_io[0]
+                recv_b = counters[1] - self._prev_net_io[1]
                 self._last_net_sent_bytes = sent_b
                 self._last_net_recv_bytes = recv_b
                 send_mbps = sent_b * 8 / 1_000_000 / elapsed

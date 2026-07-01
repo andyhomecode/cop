@@ -19,6 +19,13 @@ _SS_BYTES_SENT_RE = re.compile(r'\bbytes_sent:(\d+)\b')
 _SS_BYTES_RECV_RE = re.compile(r'\bbytes_received:(\d+)\b')
 _SS_USERS_RE = re.compile(r'users:\(\("([^"]+)",pid=(\d+)')
 
+# Interface name prefixes for loopback and container-internal networking (Docker
+# bridges, veth pairs). Traffic on these never leaves the host, so it's excluded
+# from system-wide send/recv totals — otherwise a busy Docker host's internal
+# container-to-container traffic (e.g. an app talking to its own DB) gets counted
+# the same as real internet egress/ingress.
+_INTERNAL_IFACE_PREFIXES = ("lo", "docker", "br-", "veth")
+
 # Shared across all monitor instances for the daemon's lifetime
 _IP_CACHE: dict[str, str] = {}
 
@@ -78,6 +85,20 @@ class BaseMonitor(ABC):
     @abstractmethod
     async def learn(self) -> None:
         """Snapshot current state into baseline DB."""
+
+    def _external_net_io_counters(self) -> tuple[int, int]:
+        """Cumulative (bytes_sent, bytes_recv) across real external interfaces only.
+
+        Excludes loopback and Docker-internal interfaces (see _INTERNAL_IFACE_PREFIXES)
+        so container-to-container traffic isn't mistaken for external bandwidth.
+        """
+        sent = recv = 0
+        for name, counters in psutil.net_io_counters(pernic=True).items():
+            if name.startswith(_INTERNAL_IFACE_PREFIXES):
+                continue
+            sent += counters.bytes_sent
+            recv += counters.bytes_recv
+        return sent, recv
 
     # ------------------------------------------------------------------ #
     # Connection enrichment — shared by NetworkMonitor & ResourceMonitor   #

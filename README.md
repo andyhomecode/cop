@@ -124,6 +124,8 @@ Kernel threads (ppid=2, `kthreadd` children such as `kworker/*`, `ksoftirqd/*`) 
 ### NetworkMonitor
 Only alertable addresses are tracked: `0.0.0.0`, `::`, and the entire `127.0.0.0/8` loopback range. Ports bound to Tailscale IPs, LAN-specific IPs, or other non-canonical addresses are silently ignored in both baseline and runtime — this prevents ephemeral Tailscale port churn from generating noise.
 
+Data volume tracking (`data_volume_anomaly`) and ResourceMonitor's bandwidth checks (`high_network_send`/`high_network_recv`) sum traffic across real external interfaces only — loopback (`lo`) and Docker-internal interfaces (`docker*`, `br-*`, `veth*`) are excluded. Without this, a busy Docker host's container-to-container traffic (e.g. an app talking to its own database) gets counted the same as actual internet egress/ingress, producing false-positive spikes with no real bandwidth leaving the machine.
+
 ### FileMonitor
 - **Directory paths** (`~/.ssh`, `/etc`, `/home`) are watched recursively.
 - **File paths** (`/var/run/docker.sock`) are watched non-recursively on their parent directory, preventing Docker's containerd runtime files in `/var/run/containerd/` from generating noise.
@@ -207,7 +209,7 @@ When `ollama.enabled: true`, every non-deduplicated alert is scored by a local O
 | `ollama_risk` | int 0–10 | 0 = benign, 10 = critical |
 | `ollama_comment` | string | ≤15-word summary of why |
 
-These fields are stamped into `alert.context` and appear in `alerts.jsonl`. If Ollama is unreachable or times out, the alert still fires with `ollama_risk: 0` and `ollama_comment: "Ollama Down"`, and an error is logged.
+These fields are stamped into `alert.context` and appear in `alerts.jsonl`. If Ollama is unreachable or times out, no `ollama_risk` is set — the alert dispatches normally (fails open) with `ollama_comment: "Ollama Down"` in its context, and an error is logged. A scoring failure is never treated as a risk score of `0`, so a `min_risk` filter can't silently swallow an alert just because Ollama was slow or down.
 
 The scoring prompt includes two context blocks prepended before the alert:
 
@@ -238,7 +240,7 @@ ollama:
     - "no malicious indicators"
 ```
 
-Both filters are independent and either one alone can suppress an alert. If Ollama is unreachable (`ollama_comment: "Ollama Down"`), a `min_risk > 0` filter will suppress those alerts too since the fallback risk is `0` — set `min_risk: 0` to disable the filter if you want alerts to fire even when Ollama is down.
+Both filters are independent and either one alone can suppress an alert. Suppression only applies to alerts that were actually scored — if Ollama is unreachable or times out (`ollama_comment: "Ollama Down"`), the alert has no `ollama_risk` and is dispatched unfiltered rather than being suppressed.
 
 ### ntfy priority mapping
 
@@ -388,11 +390,10 @@ nc -l 19999 &
 kill %1
 ```
 
-**`data_volume_anomaly` (WARN)** — send >100 MB/min outbound; detected on next 30 s cycle:
+**`data_volume_anomaly` (WARN)** — send >100 MB/min outbound; measured on real external interfaces only, so `localhost`/loopback no longer triggers it — detected on next 30 s cycle:
 ```bash
-nc -l 9999 > /dev/null &
-dd if=/dev/zero bs=1M count=200 | nc localhost 9999
-kill %1
+# needs a real remote endpoint, e.g. a second host on your LAN running: nc -l 9999 > /dev/null
+dd if=/dev/zero bs=1M count=200 | nc <remote-host> 9999
 ```
 
 ### ResourceMonitor
@@ -402,17 +403,15 @@ kill %1
 timeout 130 python3 -c "while True: pass" &
 ```
 
-**`high_network_send` (WARN)** / **`high_network_recv` (WARN)** — >50 Mbps send or >100 Mbps recv; loopback counts for both; detected within 15 s:
+**`high_network_send` (WARN)** / **`high_network_recv` (WARN)** — >50 Mbps send or >100 Mbps recv; measured on real external interfaces only — loopback and Docker interfaces (`docker*`, `br-*`, `veth*`) are excluded, so `localhost` no longer triggers it; detected within 15 s:
 ```bash
-# with iperf3
-iperf3 -s -D
-iperf3 -c localhost -t 30 -b 200M
+# with iperf3, against a second host on your LAN
+iperf3 -s -D                       # on the remote host
+iperf3 -c <remote-host> -t 30 -b 200M
 pkill iperf3
 
-# with nc (no iperf3 needed)
-nc -l 9999 > /dev/null &
-dd if=/dev/zero bs=64k | nc localhost 9999
-kill %1
+# with nc (no iperf3 needed) — remote host runs: nc -l 9999 > /dev/null
+dd if=/dev/zero bs=64k | nc <remote-host> 9999
 ```
 
 ### FileMonitor

@@ -182,13 +182,13 @@ class NetworkMonitor(BaseMonitor):
         return False
 
     async def _check_data_volume(self) -> None:
-        counters = psutil.net_io_counters()
+        sent_bytes, recv_bytes = self._external_net_io_counters()
         now = time.monotonic()
         if self._prev_net_bytes and self._prev_net_time:
             elapsed = now - self._prev_net_time
             if elapsed > 0:
-                sent_mb = (counters.bytes_sent - self._prev_net_bytes["sent"]) / 1_000_000
-                recv_mb = (counters.bytes_recv - self._prev_net_bytes["recv"]) / 1_000_000
+                sent_mb = (sent_bytes - self._prev_net_bytes["sent"]) / 1_000_000
+                recv_mb = (recv_bytes - self._prev_net_bytes["recv"]) / 1_000_000
                 sent_rate = sent_mb / elapsed * 60
                 recv_rate = recv_mb / elapsed * 60
                 threshold = self._config.data_volume_threshold_mb
@@ -234,8 +234,8 @@ class NetworkMonitor(BaseMonitor):
                         ))
         self._snapshot_connections()
         self._prev_net_bytes = {
-            "sent": counters.bytes_sent,
-            "recv": counters.bytes_recv,
+            "sent": sent_bytes,
+            "recv": recv_bytes,
         }
         self._prev_net_time = now
 

@@ -300,7 +300,7 @@ class TestBaseMonitorConnections:
         fake_counters.bytes_sent = base_sent       # no outbound traffic
         fake_counters.bytes_recv = high_recv
 
-        with patch("cop.monitors.network.psutil.net_io_counters", return_value=fake_counters), \
+        with patch("cop.monitors.base.psutil.net_io_counters", return_value={"eno2": fake_counters}), \
              patch("cop.monitors.network.time.monotonic", return_value=31.0), \
              patch.object(monitor, "_get_connections", return_value=[]), \
              patch.object(monitor, "_format_connections", new_callable=AsyncMock, return_value=""):

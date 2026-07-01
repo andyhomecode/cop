@@ -27,8 +27,8 @@ class OllamaScorer:
         self._data_dir = data_dir
         self._history: deque[tuple[datetime, str, str]] = deque(maxlen=config.history_count)
 
-    async def score(self, alert: Alert) -> tuple[int, str]:
-        """Call Ollama and return (risk 0-10, comment). Returns (0, 'Ollama Down') on connection failure."""
+    async def score(self, alert: Alert) -> tuple[int, str] | None:
+        """Call Ollama and return (risk 0-10, comment). Returns None on connection/timeout failure."""
         prompt = (
             "You are a calm, experienced Linux security analyst. "
             "Score the actual risk of this alert, not just its surface appearance. "
@@ -83,7 +83,7 @@ class OllamaScorer:
                 return risk, comment
         except Exception as exc:
             logger.error("Ollama scoring failed for %s: %s: %s", alert.rule_id, type(exc).__name__, exc)
-            return 0, "Ollama Down"
+            return None
 
     async def assess(self, health_text: str, context_notes: str, recent_alerts: list[dict]) -> str:
         """Generate a free-text situational assessment from health, notes, and recent events."""
