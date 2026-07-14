@@ -2,10 +2,28 @@ from __future__ import annotations
 
 import asyncio
 import ipaddress
+import re
+import subprocess
 import time
 from typing import TYPE_CHECKING
 
 import psutil
+
+_DOCKER_SIZE_RE = re.compile(r"^([\d.]+)\s*([kKmMgGtT]?)[bB]$")
+_DOCKER_SIZE_MULTIPLIERS = {"": 1, "k": 1_000, "m": 1_000_000, "g": 1_000_000_000, "t": 1_000_000_000_000}
+
+# Containers sharing a network namespace (e.g. `network_mode: service:gluetun`) report
+# identical cumulative NetIO — summing them would double-count the same bytes. Taking the
+# max per poll gives a safe, non-inflated estimate of "how much did the trusted group move".
+_CONTAINER_SUPPRESS_RATIO = 0.6
+
+
+def _parse_docker_size(s: str) -> int:
+    m = _DOCKER_SIZE_RE.match(s.strip())
+    if not m:
+        return 0
+    value, unit = m.groups()
+    return int(float(value) * _DOCKER_SIZE_MULTIPLIERS[unit.lower()])
 
 _LOOPBACK = ipaddress.ip_network("127.0.0.0/8")
 _LOOPBACK6 = ipaddress.ip_network("::1/128")
@@ -51,6 +69,7 @@ class NetworkMonitor(BaseMonitor):
         self._prev_net_bytes: dict | None = None
         self._prev_net_time: float | None = None
         self._alerted_outbound: set[tuple] = set()
+        self._prev_docker_bytes: dict[str, tuple[int, int]] = {}
 
     async def run(self) -> None:
         port_baseline = await self._baseline.get_port_baseline()
@@ -168,6 +187,47 @@ class NetworkMonitor(BaseMonitor):
                 },
             ))
 
+    def _trusted_docker_stats(self) -> dict[str, tuple[int, int]]:
+        """Cumulative (rx_bytes, tx_bytes) per trusted container name, via `docker stats`."""
+        names = getattr(self._config, "trusted_docker_containers", None)
+        if not names:
+            return {}
+        try:
+            out = subprocess.check_output(
+                ["docker", "stats", "--no-stream", "--format", "{{.Name}}\t{{.NetIO}}"],
+                text=True, stderr=subprocess.DEVNULL, timeout=10,
+            )
+        except Exception:
+            return {}
+        result: dict[str, tuple[int, int]] = {}
+        for line in out.splitlines():
+            parts = line.split("\t")
+            if len(parts) != 2 or parts[0] not in names:
+                continue
+            halves = [h.strip() for h in parts[1].split("/")]
+            if len(halves) != 2:
+                continue
+            result[parts[0]] = (_parse_docker_size(halves[0]), _parse_docker_size(halves[1]))
+        return result
+
+    def _trusted_docker_delta(self) -> tuple[int, int]:
+        """Best-effort (recv_bytes, sent_bytes) moved by trusted containers since the last poll.
+
+        Containers sharing a network namespace (common for a VPN + torrent client setup,
+        e.g. `network_mode: service:gluetun`) report identical cumulative NetIO — summing
+        them would double-count the same underlying bytes, so this takes the max delta
+        across trusted containers instead.
+        """
+        current = self._trusted_docker_stats()
+        recv_delta = sent_delta = 0
+        for name, (rx, tx) in current.items():
+            prev = self._prev_docker_bytes.get(name)
+            if prev is not None:
+                recv_delta = max(recv_delta, rx - prev[0])
+                sent_delta = max(sent_delta, tx - prev[1])
+        self._prev_docker_bytes = current
+        return max(0, recv_delta), max(0, sent_delta)
+
     def _is_trusted_addr(self, addr: str) -> bool:
         try:
             ip = ipaddress.ip_address(addr)
@@ -195,6 +255,21 @@ class NetworkMonitor(BaseMonitor):
 
                 over_send = sent_rate > threshold
                 over_recv = recv_rate > threshold
+
+                trusted_recv, trusted_sent = self._trusted_docker_delta()
+                if over_send and trusted_sent >= sent_mb * 1_000_000 * _CONTAINER_SUPPRESS_RATIO:
+                    self._logger.info(
+                        "Suppressing data_volume_anomaly: %.1f MB attributed to trusted containers",
+                        trusted_sent / 1_000_000,
+                    )
+                    over_send = False
+                if over_recv and trusted_recv >= recv_mb * 1_000_000 * _CONTAINER_SUPPRESS_RATIO:
+                    self._logger.info(
+                        "Suppressing data_volume_anomaly_recv: %.1f MB attributed to trusted containers",
+                        trusted_recv / 1_000_000,
+                    )
+                    over_recv = False
+
                 if over_send or over_recv:
                     conns = self._get_connections()
                     remote_ips = list({c["raddr"] for c in conns})

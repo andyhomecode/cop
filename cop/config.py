@@ -66,6 +66,7 @@ class NetworkMonitorConfig:
         ]
     )
     trusted_outbound_process_names: list[str] = field(default_factory=list)
+    trusted_docker_containers: list[str] = field(default_factory=list)
 
 
 @dataclass

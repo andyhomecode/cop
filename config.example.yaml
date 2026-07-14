@@ -89,6 +89,12 @@ monitors:
     trusted_process_names:
       - tailscaled
       - systemd-resolved
+    # Docker containers whose traffic suppresses data_volume_anomaly when they account
+    # for most of a spike (e.g. a torrent client). Matched via `docker stats`, so it also
+    # covers containers that share this one's network namespace (network_mode: service:X).
+    trusted_docker_containers: []
+    # Example:
+    #   - gluetun    # VPN container; qbittorrent/prowlarr/bazarr share its netns here
 
   file:
     enabled: true

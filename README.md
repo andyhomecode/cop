@@ -77,6 +77,7 @@ Key settings to review:
 | `monitors.network.data_volume_window_seconds` | `60` | Window over which outbound bytes are summed for anomaly detection |
 | `monitors.network.suspicious_outbound_ports` | `[1080, 3333, 4444, ...]` | Ports that fire `suspicious_outbound_port` CRITICAL when any process connects to them |
 | `monitors.network.trusted_outbound_process_names` | `[]` | Process names exempt from suspicious outbound port alerting |
+| `monitors.network.trusted_docker_containers` | `[]` | Docker container names that suppress `data_volume_anomaly`/`_recv` when they account for most of a spike (e.g. a torrent client). Read via `docker stats`, so containers sharing another's network namespace (`network_mode: service:X`) are covered by listing either name |
 | `monitors.persistence.cron_paths` | (all standard cron dirs) | Directories to watch for new/modified cron files |
 | `monitors.persistence.systemd_paths` | `/etc/systemd/system, ...` | Directories to watch for new `.service`/`.timer` units |
 | `monitors.persistence.known_units` | `[]` | Unit filenames pre-approved and excluded from `new_systemd_unit` alerts |
