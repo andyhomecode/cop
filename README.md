@@ -17,7 +17,7 @@ cop daemon (asyncio)
 ├── PersistenceMonitor  — new cron jobs and systemd units (common persistence vectors)
 ├── PackageMonitor      — tail /var/log/dpkg.log for installs/removals
 ├── KernelMonitor       — tail /var/log/kern.log for unexpected module loads
-└── TripwireMonitor     — inotify IN_ACCESS on honeypot files; fires on any read
+└── TripwireMonitor     — watches honeypot files; fires CRITICAL on any open
 
 Alert flow: monitor → AlertEngine (redact secrets → dedup + cooldown) → [Ollama scorer] → ntfy.sh + Telegram + alerts.jsonl
 State: SQLite at ~/.local/share/cop/baseline.db (when run as root)
@@ -127,6 +127,8 @@ Only alertable addresses are tracked: `0.0.0.0`, `::`, and the entire `127.0.0.0
 
 Data volume tracking (`data_volume_anomaly`) and ResourceMonitor's bandwidth checks (`high_network_send`/`high_network_recv`) sum traffic across real external interfaces only — loopback (`lo`) and Docker-internal interfaces (`docker*`, `br-*`, `veth*`) are excluded. Without this, a busy Docker host's container-to-container traffic (e.g. an app talking to its own database) gets counted the same as actual internet egress/ingress, producing false-positive spikes with no real bandwidth leaving the machine.
 
+A container that legitimately moves a lot of data (a torrent client, a backup job) still shows up as a real spike on the physical interface, though, since its traffic actually leaves the host. `trusted_docker_containers` handles that case: each poll, cop diffs `docker stats` NetIO for the named containers, and if one of them accounts for most of the anomalous bytes, the alert is suppressed. Containers that share a network namespace (`network_mode: service:X`, e.g. a torrent client routed through a VPN container) report identical cumulative counters, so listing either name works, and the code takes the max rather than the sum across trusted containers to avoid double-counting that shared traffic.
+
 ### FileMonitor
 - **Directory paths** (`~/.ssh`, `/etc`, `/home`) are watched recursively.
 - **File paths** (`/var/run/docker.sock`) are watched non-recursively on their parent directory, preventing Docker's containerd runtime files in `/var/run/containerd/` from generating noise.
@@ -151,9 +153,9 @@ Tails `/var/log/kern.log` and matches `module loaded` log lines. On startup, run
 
 ### TripwireMonitor
 
-> **⚠️ Not working yet.** File-open detection via watchdog is currently unreliable — alerts are not firing as expected. This monitor is disabled pending a fix.
+Places watchdog watches on a list of honeypot files — files that no legitimate process should ever open. Any open fires an immediate CRITICAL alert. On startup, files that don't exist are created as empty decoys when `create_missing: true` (the default). The alert includes a best-effort process attribution by scanning `/proc/*/fd` for the accessing process at the moment the event fires — this frequently comes up empty for short-lived open/read/close patterns (e.g. a library auto-probing the file for credentials) since the accessor has often already closed the fd by the time the scan runs. Treat a hit with no attribution as inconclusive, not as evidence the check misfired: the alert itself is reliable even when the "by `<process>`" suffix is missing.
 
-Places inotify watches on a list of honeypot files — files that no legitimate process should ever open. Any read fires an immediate CRITICAL alert. On startup, files that don't exist are created as empty decoys when `create_missing: true` (the default). The alert includes a best-effort process attribution by scanning `/proc/*/fd` for the accessing process at the moment the event fires.
+Before assuming a hit is malicious, check whether it lines up with a routine root-owned timer — `wget` and some `apt`/HTTPS fetch paths consult `~/.netrc` by default on every request regardless of whether the target needs auth, so `/root/.netrc` as a tripwire will periodically fire from things like `motd-news.timer` or `apt-daily-upgrade.timer`. Compare the alert timestamp against `systemctl list-timers --all` and `journalctl -u <unit>` before escalating.
 
 Good candidates are files that attackers commonly grep for but that don't exist on a typical server: `/root/.aws/credentials`, `/root/.gnupg/secring.gpg`, `/root/.netrc`. Only add real files (e.g. `/root/.ssh/id_rsa`) if you are certain no legitimate tool reads them — backup agents and ssh-agents do.
 
@@ -528,8 +530,6 @@ sudo modprobe -r dummy
 
 ### TripwireMonitor
 
-> **⚠️ Not working yet** — alerts are not firing reliably.
-
 **`tripwire_<filename>` (CRITICAL)** — read any honeypot file; detected immediately:
 ```bash
 cat /root/.aws/credentials
@@ -562,7 +562,6 @@ docker pull alpine:latest
 
 - **Docker image digest tracking** — add `image_digest_baseline` table to SQLite. In `DockerMonitor.learn()`, record the RepoDigest of each running container's image. In `_handle_image_pull()`, compare new digest against baseline and alert `docker_image_digest_changed` WARN on mismatch. Guards against supply-chain compromise via updated images.
 - **Auto Shutdown on Critical** — add an option to automatically shutdown either most processes, disconnect network, or shutdown the PC on Critical alerts.
-- **Whitelist for busy containers** — add a whitelist for known busy containers so they don't alert on expected network traffic.
 
 
 
