@@ -182,7 +182,7 @@ class TripwireMonitorConfig:
         default_factory=lambda: [
             "/root/.aws/credentials",
             "/root/.gnupg/secring.gpg",
-            "/root/.netrc",
+            "/root/.env",
         ]
     )
     # Create empty decoy files for entries that don't already exist

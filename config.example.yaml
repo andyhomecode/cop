@@ -158,12 +158,15 @@ monitors:
     files:
       - "/root/.aws/credentials"        # AWS credential grab
       - "/root/.gnupg/secring.gpg"      # Legacy GPG private key (rarely exists)
-      - "/root/.netrc"                   # Plaintext FTP/HTTP credentials
+      - "/root/.env"                     # App secrets — commonly grepped for, nothing reads it by default
+      # Do NOT use "/root/.netrc" here: curl/wget/apt's HTTP fetch path probes
+      # it on every request whether or not auth is needed, so it fires from
+      # routine root-owned timers (apt-daily*, motd-news) — confirmed in
+      # production, see README's TripwireMonitor section.
       # Other good candidates:
       # - "/root/.ssh/id_rsa"           # Only add if you don't actually use this key
       # - "/root/.docker/config.json"   # Docker Hub auth token
       # - "/var/www/html/wp-config.php" # WordPress DB credentials
-      # - "/opt/app/.env"               # App secrets (adjust to your stack)
     create_missing: true                # Create empty decoy files that don't already exist
 
   resource:
