@@ -40,6 +40,16 @@ class _TripwireEventHandler(FileSystemEventHandler):
         self._loop.call_soon_threadsafe(_put)
 
 
+#: Basenames that must never be armed as tripwires, even if a config lists them.
+#: ``.netrc`` is probed by curl/wget/apt's HTTP fetch path on every request
+#: regardless of whether auth is needed, so it fires from routine root-owned
+#: timers (apt-daily*, motd-news). Attribution never resolves (quick
+#: open/read/close finishes before the /proc/*/fd scan), so there's no process
+#: identity to allowlist — the only fix is not watching it. See the README's
+#: TripwireMonitor section.
+_BLOCKED_TRIPWIRE_NAMES = {".netrc"}
+
+
 class TripwireMonitor(BaseMonitor):
     name = "TripwireMonitor"
 
@@ -87,6 +97,14 @@ class TripwireMonitor(BaseMonitor):
         resolved: set[str] = set()
         for p_str in self._config.files:
             path = Path(p_str).expanduser()
+            if path.name in _BLOCKED_TRIPWIRE_NAMES:
+                self._logger.warning(
+                    "Refusing to arm tripwire %s: %s is a known false-positive source "
+                    "(probed by curl/wget/apt on every request) and cannot be attributed "
+                    "or allowlisted — remove it from tripwire.files. See README.",
+                    path, path.name,
+                )
+                continue
             if not path.exists():
                 if self._config.create_missing:
                     try:

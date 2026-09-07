@@ -9,10 +9,16 @@ import psutil
 import pytest
 
 from cop.alerts import Severity
-from cop.config import NetworkMonitorConfig, ProcessMonitorConfig, ResourceMonitorConfig
+from cop.config import (
+    NetworkMonitorConfig,
+    ProcessMonitorConfig,
+    ResourceMonitorConfig,
+    TripwireMonitorConfig,
+)
 from cop.monitors.network import NetworkMonitor
 from cop.monitors.process import ProcessMonitor
 from cop.monitors.resource import ResourceMonitor
+from cop.monitors.tripwire import TripwireMonitor
 
 
 @pytest.fixture
@@ -338,3 +344,31 @@ class TestResourceMonitor:
         assert alert.rule_id == "high_cpu_sustained"
         assert "mallory" in alert.message
         assert alert.context["username"] == "mallory"
+
+
+class TestTripwireMonitor:
+    def test_netrc_is_never_armed_even_if_configured(self, tmp_path, mock_baseline, mock_engine):
+        netrc = tmp_path / ".netrc"
+        netrc.write_text("machine example.com login x password y\n")
+        real = tmp_path / ".env"
+        real.write_text("SECRET=1\n")
+
+        config = TripwireMonitorConfig(
+            files=[str(netrc), str(real)], create_missing=False
+        )
+        monitor = TripwireMonitor(config, mock_baseline, mock_engine)
+
+        resolved = monitor._setup_files()
+
+        assert str(netrc) not in resolved
+        assert str(real) in resolved
+
+    def test_netrc_blocked_regardless_of_directory(self, tmp_path, mock_baseline, mock_engine):
+        nested = tmp_path / "home" / "someuser" / ".netrc"
+        nested.parent.mkdir(parents=True)
+        nested.write_text("x\n")
+
+        config = TripwireMonitorConfig(files=[str(nested)], create_missing=True)
+        monitor = TripwireMonitor(config, mock_baseline, mock_engine)
+
+        assert monitor._setup_files() == set()
