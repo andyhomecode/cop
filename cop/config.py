@@ -52,7 +52,13 @@ class NetworkMonitorConfig:
         default_factory=lambda: ["dropbox", "tailscaled", "systemd-resolved"]
     )
     data_volume_window_seconds: int = 60
+    # Unexplained outbound MB/min (total minus trusted containers and units)
+    # that must hold for data_volume_sustained_seconds before alerting.
     data_volume_threshold_mb: float = 100.0
+    data_volume_sustained_seconds: int = 300
+    # Inbound volume is rarely a security signal (downloads, streams to the
+    # box), so data_volume_anomaly_recv is off unless asked for.
+    alert_on_inbound: bool = False
     suspicious_outbound_ports: list[int] = field(
         default_factory=lambda: [
             1080,           # SOCKS proxy
@@ -67,6 +73,9 @@ class NetworkMonitorConfig:
     )
     trusted_outbound_process_names: list[str] = field(default_factory=list)
     trusted_docker_containers: list[str] = field(default_factory=list)
+    # systemd units whose traffic is subtracted too (needs IPAccounting=yes on
+    # the unit), e.g. dropboxd@dropboxsync.service.
+    trusted_systemd_units: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -130,6 +139,10 @@ class ResourceMonitorConfig:
     cpu_threshold_percent: float = 90.0
     cpu_sustained_seconds: int = 120
     memory_threshold_percent: float = 85.0
+    # high_network_send/recv: raw system-wide rate alerts. Off by default:
+    # NetworkMonitor's data_volume_anomaly covers outbound with trusted
+    # traffic subtracted, and these fire on every big download or stream.
+    net_alerts_enabled: bool = False
     net_send_threshold_mbps: float = 50.0
     net_recv_threshold_mbps: float = 100.0
     check_interval_seconds: int = 15

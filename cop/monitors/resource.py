@@ -127,6 +127,8 @@ class ResourceMonitor(BaseMonitor):
             ))
 
     async def _check_network(self, send_mbps: float, recv_mbps: float) -> None:
+        if not self._config.net_alerts_enabled:
+            return
         over_send = send_mbps >= self._config.net_send_threshold_mbps
         over_recv = recv_mbps >= self._config.net_recv_threshold_mbps
         if not (over_send or over_recv):

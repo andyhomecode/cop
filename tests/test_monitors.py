@@ -290,34 +290,137 @@ class TestBaseMonitorConnections:
         assert monitor._conn_proc_cache[key]["process_name"] == "speedtest-cli"
         assert monitor._conn_proc_cache[key]["pid"] == 5555
 
-    @pytest.mark.asyncio
-    async def test_data_volume_anomaly_fires_for_high_inbound(self, mock_baseline, mock_engine):
-        config = NetworkMonitorConfig(data_volume_threshold_mb=10.0)
-        monitor = NetworkMonitor(config, mock_baseline, mock_engine)
+    # --- data volume: unexplained traffic, sustained, one alert per episode ---
 
-        base_sent = 1_000_000
-        base_recv = 1_000_000
-        # 200 MB received in 30s → 400 MB/min, over threshold of 10 MB/min
-        high_recv = base_recv + 200_000_000
-        monitor._prev_net_bytes = {"sent": base_sent, "recv": base_recv}
-        monitor._prev_net_time = 1.0  # non-zero so the truthiness check passes
+    @staticmethod
+    def _counters(sent: int, recv: int) -> dict:
+        c = MagicMock()
+        c.bytes_sent = sent
+        c.bytes_recv = recv
+        return {"eno2": c}
 
-        fake_counters = MagicMock()
-        fake_counters.bytes_sent = base_sent       # no outbound traffic
-        fake_counters.bytes_recv = high_recv
-
-        with patch("cop.monitors.base.psutil.net_io_counters", return_value={"eno2": fake_counters}), \
-             patch("cop.monitors.network.time.monotonic", return_value=31.0), \
+    async def _poll(self, monitor, t: float, sent: int, recv: int = 0, trusted=None):
+        """One _check_data_volume call at time t with cumulative counters."""
+        with patch("cop.monitors.base.psutil.net_io_counters", return_value=self._counters(sent, recv)), \
+             patch("cop.monitors.network.time.monotonic", return_value=t), \
+             patch.object(monitor, "_trusted_docker_stats", return_value=trusted or {}), \
+             patch.object(monitor, "_trusted_unit_stats", return_value={}), \
              patch.object(monitor, "_get_connections", return_value=[]), \
              patch.object(monitor, "_format_connections", new_callable=AsyncMock, return_value=""):
             await monitor._check_data_volume()
 
-        fired_ids = [call[0][0].rule_id for call in mock_engine.fire.call_args_list]
-        assert "data_volume_anomaly_recv" in fired_ids
-        assert "data_volume_anomaly" not in fired_ids
+    @staticmethod
+    def _fired(engine) -> list[str]:
+        return [call[0][0].rule_id for call in engine.fire.call_args_list]
+
+    @pytest.mark.asyncio
+    async def test_outbound_fires_once_after_sustained_period(self, mock_baseline, mock_engine):
+        config = NetworkMonitorConfig(data_volume_threshold_mb=10.0, data_volume_sustained_seconds=90)
+        monitor = NetworkMonitor(config, mock_baseline, mock_engine)
+        # 60 MB per 30 s = 120 MB/min, well over 10 MB/min
+        for i in range(3):
+            await self._poll(monitor, 30.0 * i, sent=60_000_000 * i)
+        assert self._fired(mock_engine) == []          # held 60 s < 90 s
+        await self._poll(monitor, 90.0, sent=180_000_000)
+        assert self._fired(mock_engine) == ["data_volume_anomaly"]
+        await self._poll(monitor, 120.0, sent=240_000_000)
+        assert self._fired(mock_engine) == ["data_volume_anomaly"]  # same episode: no repeat
+
+    @pytest.mark.asyncio
+    async def test_outbound_rearms_after_dropping_under(self, mock_baseline, mock_engine):
+        config = NetworkMonitorConfig(data_volume_threshold_mb=10.0, data_volume_sustained_seconds=30)
+        monitor = NetworkMonitor(config, mock_baseline, mock_engine)
+        await self._poll(monitor, 0.0, sent=0)
+        await self._poll(monitor, 30.0, sent=60_000_000)            # episode 1 fires
+        await self._poll(monitor, 60.0, sent=60_000_000)            # quiet: re-arm
+        await self._poll(monitor, 90.0, sent=120_000_000)           # episode 2 fires
+        assert self._fired(mock_engine) == ["data_volume_anomaly", "data_volume_anomaly"]
+
+    @pytest.mark.asyncio
+    async def test_short_burst_does_not_fire(self, mock_baseline, mock_engine):
+        config = NetworkMonitorConfig(data_volume_threshold_mb=10.0, data_volume_sustained_seconds=300)
+        monitor = NetworkMonitor(config, mock_baseline, mock_engine)
+        await self._poll(monitor, 0.0, sent=0)
+        await self._poll(monitor, 30.0, sent=500_000_000)           # big 30 s burst
+        await self._poll(monitor, 60.0, sent=500_000_000)
+        assert self._fired(mock_engine) == []
+
+    @pytest.mark.asyncio
+    async def test_trusted_traffic_is_subtracted(self, mock_baseline, mock_engine):
+        config = NetworkMonitorConfig(
+            data_volume_threshold_mb=10.0, data_volume_sustained_seconds=0,
+            trusted_docker_containers=["jellyfin"],
+        )
+        monitor = NetworkMonitor(config, mock_baseline, mock_engine)
+        await self._poll(monitor, 0.0, sent=0, trusted={"jellyfin": (0, 0)})
+        # 100 MB out, 98 MB of it from jellyfin -> 2 MB/30 s = 4 MB/min unexplained
+        await self._poll(monitor, 30.0, sent=100_000_000, trusted={"jellyfin": (0, 98_000_000)})
+        assert self._fired(mock_engine) == []
+        # 100 MB more out, jellyfin only 50 MB -> 100 MB/min unexplained
+        await self._poll(monitor, 60.0, sent=200_000_000, trusted={"jellyfin": (0, 148_000_000)})
+        assert self._fired(mock_engine) == ["data_volume_anomaly"]
+
+    @pytest.mark.asyncio
+    async def test_shared_netns_containers_counted_once(self, mock_baseline, mock_engine):
+        config = NetworkMonitorConfig(
+            data_volume_threshold_mb=10.0, data_volume_sustained_seconds=0,
+            trusted_docker_containers=["gluetun", "qbittorrent"],
+        )
+        monitor = NetworkMonitor(config, mock_baseline, mock_engine)
+        zero = {"gluetun": (0, 0), "qbittorrent": (0, 0)}
+        await self._poll(monitor, 0.0, sent=0, trusted=zero)
+        # Both report the same 50 MB; real total is 100 MB, so 50 MB (100 MB/min)
+        # is unexplained. Summing both would wrongly hide it.
+        same = {"gluetun": (0, 50_000_000), "qbittorrent": (0, 50_000_000)}
+        await self._poll(monitor, 30.0, sent=100_000_000, trusted=same)
+        assert self._fired(mock_engine) == ["data_volume_anomaly"]
+
+    @pytest.mark.asyncio
+    async def test_inbound_ignored_unless_enabled(self, mock_baseline, mock_engine):
+        quiet = NetworkMonitor(
+            NetworkMonitorConfig(data_volume_threshold_mb=10.0, data_volume_sustained_seconds=0),
+            mock_baseline, mock_engine,
+        )
+        await self._poll(quiet, 0.0, sent=0, recv=0)
+        await self._poll(quiet, 30.0, sent=0, recv=200_000_000)
+        assert self._fired(mock_engine) == []
+
+        loud = NetworkMonitor(
+            NetworkMonitorConfig(data_volume_threshold_mb=10.0, data_volume_sustained_seconds=0,
+                                 alert_on_inbound=True),
+            mock_baseline, mock_engine,
+        )
+        await self._poll(loud, 0.0, sent=0, recv=0)
+        await self._poll(loud, 30.0, sent=0, recv=200_000_000)
+        assert self._fired(mock_engine) == ["data_volume_anomaly_recv"]
+
+    def test_unit_stats_parsed_and_no_data_skipped(self, mock_baseline, mock_engine):
+        config = NetworkMonitorConfig(trusted_systemd_units=["dropbox.service", "off.service"])
+        monitor = NetworkMonitor(config, mock_baseline, mock_engine)
+        outputs = {
+            "dropbox.service": "IPIngressBytes=1000\nIPEgressBytes=2000\n",
+            "off.service": "IPIngressBytes=[no data]\nIPEgressBytes=[no data]\n",
+        }
+        with patch("cop.monitors.network.subprocess.check_output",
+                   side_effect=lambda cmd, **kw: outputs[cmd[-1]]):
+            assert monitor._trusted_unit_stats() == {"dropbox.service": (1000, 2000)}
 
 
 class TestResourceMonitor:
+    @pytest.mark.asyncio
+    async def test_raw_network_alerts_off_by_default(self, mock_baseline, mock_engine):
+        monitor = ResourceMonitor(ResourceMonitorConfig(), mock_baseline, mock_engine)
+        await monitor._check_network(send_mbps=900.0, recv_mbps=900.0)
+        mock_engine.fire.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_raw_network_alerts_when_enabled(self, mock_baseline, mock_engine):
+        monitor = ResourceMonitor(ResourceMonitorConfig(net_alerts_enabled=True), mock_baseline, mock_engine)
+        with patch.object(monitor, "_get_connections", return_value=[]), \
+             patch.object(monitor, "_format_connections", new_callable=AsyncMock, return_value=""):
+            await monitor._check_network(send_mbps=900.0, recv_mbps=0.0)
+        assert [c[0][0].rule_id for c in mock_engine.fire.call_args_list] == ["high_network_send"]
+
     @pytest.mark.asyncio
     async def test_high_cpu_alert_includes_username(self, mock_baseline, mock_engine):
         config = ResourceMonitorConfig(cpu_threshold_percent=50, cpu_sustained_seconds=60)

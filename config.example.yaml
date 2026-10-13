@@ -77,8 +77,13 @@ monitors:
     baseline_ports_override: []
     # Window (seconds) over which outbound bytes are summed for data_volume_anomaly
     data_volume_window_seconds: 60
-    # Outbound data rate that triggers data_volume_anomaly (MB/min)
+    # data_volume_anomaly: alert when *unexplained* outbound traffic (total minus
+    # trusted containers and units below) stays over this many MB/min for
+    # data_volume_sustained_seconds. One alert per episode.
     data_volume_threshold_mb: 100
+    data_volume_sustained_seconds: 300
+    # Also alert on unexplained inbound volume (data_volume_anomaly_recv)
+    alert_on_inbound: false
     # Outbound connections to these CIDRs are not flagged
     trusted_cidrs:
       - "127.0.0.0/8"
@@ -89,12 +94,19 @@ monitors:
     trusted_process_names:
       - tailscaled
       - systemd-resolved
-    # Docker containers whose traffic suppresses data_volume_anomaly when they account
-    # for most of a spike (e.g. a torrent client). Matched via `docker stats`, so it also
-    # covers containers that share this one's network namespace (network_mode: service:X).
+    # Containers whose traffic is subtracted before checking data_volume_anomaly.
+    # Read via `docker stats`; containers sharing a network namespace
+    # (network_mode: service:X) are counted once. Only trust containers whose
+    # traffic is mostly external: NetIO includes container-to-container traffic.
     trusted_docker_containers: []
     # Example:
     #   - gluetun    # VPN container; qbittorrent/prowlarr/bazarr share its netns here
+    #   - jellyfin
+    # systemd units whose traffic is subtracted too. Each needs IP accounting:
+    #   sudo systemctl set-property <unit> IPAccounting=yes
+    trusted_systemd_units: []
+    # Example:
+    #   - dropboxd@dropboxsync.service
 
   file:
     enabled: true
@@ -174,6 +186,7 @@ monitors:
     cpu_threshold_percent: 90.0         # per-process CPU % to trigger check
     cpu_sustained_seconds: 120          # must be sustained this long before alerting
     memory_threshold_percent: 85.0      # system-wide memory %
+    net_alerts_enabled: false           # raw high_network_send/recv alerts (no subtraction)
     net_send_threshold_mbps: 50.0       # system-wide send rate
     net_recv_threshold_mbps: 100.0      # system-wide recv rate
     check_interval_seconds: 15

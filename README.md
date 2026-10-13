@@ -77,7 +77,12 @@ Key settings to review:
 | `monitors.network.data_volume_window_seconds` | `60` | Window over which outbound bytes are summed for anomaly detection |
 | `monitors.network.suspicious_outbound_ports` | `[1080, 3333, 4444, ...]` | Ports that fire `suspicious_outbound_port` CRITICAL when any process connects to them |
 | `monitors.network.trusted_outbound_process_names` | `[]` | Process names exempt from suspicious outbound port alerting |
-| `monitors.network.trusted_docker_containers` | `[]` | Docker container names that suppress `data_volume_anomaly`/`_recv` when they account for most of a spike (e.g. a torrent client). Read via `docker stats`, so containers sharing another's network namespace (`network_mode: service:X`) are covered by listing either name |
+| `monitors.network.data_volume_threshold_mb` | `100` | Unexplained traffic rate (MB/min) that counts as high for `data_volume_anomaly` |
+| `monitors.network.data_volume_sustained_seconds` | `300` | How long unexplained traffic must stay over the threshold before alerting |
+| `monitors.network.alert_on_inbound` | `false` | Also alert on unexplained inbound volume (`data_volume_anomaly_recv`) |
+| `monitors.network.trusted_docker_containers` | `[]` | Containers whose traffic is subtracted before checking `data_volume_anomaly` (e.g. a media server, a torrent client). Read via `docker stats`; containers sharing a network namespace (`network_mode: service:X`) are counted once |
+| `monitors.network.trusted_systemd_units` | `[]` | systemd units whose traffic is subtracted too (e.g. `dropboxd@dropboxsync.service`). Needs `IPAccounting=yes` on the unit: `sudo systemctl set-property <unit> IPAccounting=yes` |
+| `monitors.resource.net_alerts_enabled` | `false` | Turn on the raw system-wide `high_network_send`/`_recv` rate alerts |
 | `monitors.persistence.cron_paths` | (all standard cron dirs) | Directories to watch for new/modified cron files |
 | `monitors.persistence.systemd_paths` | `/etc/systemd/system, ...` | Directories to watch for new `.service`/`.timer` units |
 | `monitors.persistence.known_units` | `[]` | Unit filenames pre-approved and excluded from `new_systemd_unit` alerts |
@@ -127,7 +132,11 @@ Only alertable addresses are tracked: `0.0.0.0`, `::`, and the entire `127.0.0.0
 
 Data volume tracking (`data_volume_anomaly`) and ResourceMonitor's bandwidth checks (`high_network_send`/`high_network_recv`) sum traffic across real external interfaces only — loopback (`lo`) and Docker-internal interfaces (`docker*`, `br-*`, `veth*`) are excluded. Without this, a busy Docker host's container-to-container traffic (e.g. an app talking to its own database) gets counted the same as actual internet egress/ingress, producing false-positive spikes with no real bandwidth leaving the machine.
 
-A container that legitimately moves a lot of data (a torrent client, a backup job) still shows up as a real spike on the physical interface, though, since its traffic actually leaves the host. `trusted_docker_containers` handles that case: each poll, cop diffs `docker stats` NetIO for the named containers, and if one of them accounts for most of the anomalous bytes, the alert is suppressed. Containers that share a network namespace (`network_mode: service:X`, e.g. a torrent client routed through a VPN container) report identical cumulative counters, so listing either name works, and the code takes the max rather than the sum across trusted containers to avoid double-counting that shared traffic.
+Legitimate heavy users (a media server, a torrent client, a file sync service) still put real traffic on the physical interface. So `data_volume_anomaly` alerts on **unexplained** outbound traffic: each 30 s poll, cop subtracts what the trusted sources moved in the same interval (`trusted_docker_containers` via `docker stats` NetIO, `trusted_systemd_units` via systemd's per-unit IP accounting) from the external-interface total. Only when what's left stays over `data_volume_threshold_mb` (MB/min) for `data_volume_sustained_seconds` does it alert, once per episode; it re-arms after the rate drops back under. The alert shows the total, the trusted share per source and the unexplained remainder. Containers that share a network namespace (`network_mode: service:X`) report identical counters, so they're counted once.
+
+Caveat: a container's `docker stats` NetIO includes its traffic to other containers, not just to the outside, so a trusted container that's chatty internally can hide some real external traffic while it's busy. Trust only containers whose traffic is mostly external, and don't trust an app's database-heavy container.
+
+Inbound volume is off by default (`alert_on_inbound`): big downloads and streams to the box aren't a security signal on their own. The ResourceMonitor's raw rate alerts (`high_network_send`/`_recv`) are off by default too (`net_alerts_enabled`), since they can't subtract anything.
 
 ### FileMonitor
 - **Directory paths** (`~/.ssh`, `/etc`, `/home`) are watched recursively.
@@ -170,7 +179,8 @@ The `rule_id` is `tripwire_<filename>` (one per file), so dedup and cooldowns ar
 | `reverse_shell` | CRITICAL | Process | Process with all stdio connected to same socket |
 | `new_process` | INFO | Process | Any new non-kernel process not in baseline |
 | `new_listen_port` | CRITICAL | Network | New port on alertable address |
-| `data_volume_anomaly` | WARN | Network | Outbound data rate exceeds threshold |
+| `data_volume_anomaly` | WARN | Network | Unexplained outbound traffic (minus trusted containers/units) over threshold for the sustained period |
+| `data_volume_anomaly_recv` | WARN | Network | Same for inbound; only with `alert_on_inbound: true` |
 | `suspicious_outbound_port` | CRITICAL | Network | Established connection to a known C2/backdoor/mining port |
 | `file_critical_modified` | CRITICAL | File | Write to authorized_keys, sudoers, sshd_config, ld.so.preload, pam.d, etc. |
 | `file_created/modified/deleted/moved` | WARN | File | Change in watched path (title includes `[container]` if attributable) |
@@ -186,8 +196,8 @@ The `rule_id` is `tripwire_<filename>` (one per file), so dedup and cooldowns ar
 | `new_system_user` | CRITICAL | Auth | New user account created |
 | `high_cpu_sustained` | WARN | Resource | Process >90% CPU for 120s |
 | `high_memory` | WARN | Resource | System memory >85% |
-| `high_network_send` | WARN | Resource | System send >50 Mbps |
-| `high_network_recv` | WARN | Resource | System recv >100 Mbps |
+| `high_network_send` | WARN | Resource | System send >50 Mbps; only with `net_alerts_enabled: true` |
+| `high_network_recv` | WARN | Resource | System recv >100 Mbps; only with `net_alerts_enabled: true` |
 | `new_cron_job` | CRITICAL | Persistence | New file appeared in a cron directory |
 | `cron_job_modified` | WARN | Persistence | Existing cron file was modified |
 | `new_systemd_unit` | CRITICAL | Persistence | New `.service`, `.timer`, or `.socket` file in a systemd directory |
@@ -393,7 +403,7 @@ nc -l 19999 &
 kill %1
 ```
 
-**`data_volume_anomaly` (WARN)** — send >100 MB/min outbound; measured on real external interfaces only, so `localhost`/loopback no longer triggers it — detected on next 30 s cycle:
+**`data_volume_anomaly` (WARN)** — unexplained outbound >100 MB/min, held for 5 min (`data_volume_sustained_seconds`); measured on real external interfaces only, minus trusted containers/units. For a quick test, set the sustained period to 0 and restart cop:
 ```bash
 # needs a real remote endpoint, e.g. a second host on your LAN running: nc -l 9999 > /dev/null
 dd if=/dev/zero bs=1M count=200 | nc <remote-host> 9999
@@ -406,7 +416,7 @@ dd if=/dev/zero bs=1M count=200 | nc <remote-host> 9999
 timeout 130 python3 -c "while True: pass" &
 ```
 
-**`high_network_send` (WARN)** / **`high_network_recv` (WARN)** — >50 Mbps send or >100 Mbps recv; measured on real external interfaces only — loopback and Docker interfaces (`docker*`, `br-*`, `veth*`) are excluded, so `localhost` no longer triggers it; detected within 15 s:
+**`high_network_send` (WARN)** / **`high_network_recv` (WARN)** — only with `net_alerts_enabled: true`. >50 Mbps send or >100 Mbps recv; measured on real external interfaces only — loopback and Docker interfaces (`docker*`, `br-*`, `veth*`) are excluded, so `localhost` no longer triggers it; detected within 15 s:
 ```bash
 # with iperf3, against a second host on your LAN
 iperf3 -s -D                       # on the remote host

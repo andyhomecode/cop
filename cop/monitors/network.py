@@ -12,10 +12,6 @@ import psutil
 _DOCKER_SIZE_RE = re.compile(r"^([\d.]+)\s*([kKmMgGtT]?)[bB]$")
 _DOCKER_SIZE_MULTIPLIERS = {"": 1, "k": 1_000, "m": 1_000_000, "g": 1_000_000_000, "t": 1_000_000_000_000}
 
-# Containers sharing a network namespace (e.g. `network_mode: service:gluetun`) report
-# identical cumulative NetIO — summing them would double-count the same bytes. Taking the
-# max per poll gives a safe, non-inflated estimate of "how much did the trusted group move".
-_CONTAINER_SUPPRESS_RATIO = 0.6
 
 
 def _parse_docker_size(s: str) -> int:
@@ -69,7 +65,11 @@ class NetworkMonitor(BaseMonitor):
         self._prev_net_bytes: dict | None = None
         self._prev_net_time: float | None = None
         self._alerted_outbound: set[tuple] = set()
-        self._prev_docker_bytes: dict[str, tuple[int, int]] = {}
+        self._prev_trusted_bytes: dict[str, tuple[int, int]] = {}
+        # Per direction: when unexplained traffic went over the threshold, and
+        # whether this episode has already alerted (one alert per episode).
+        self._over_since: dict[str, float | None] = {"sent": None, "recv": None}
+        self._episode_alerted: dict[str, bool] = {"sent": False, "recv": False}
 
     async def run(self) -> None:
         port_baseline = await self._baseline.get_port_baseline()
@@ -189,7 +189,7 @@ class NetworkMonitor(BaseMonitor):
 
     def _trusted_docker_stats(self) -> dict[str, tuple[int, int]]:
         """Cumulative (rx_bytes, tx_bytes) per trusted container name, via `docker stats`."""
-        names = getattr(self._config, "trusted_docker_containers", None)
+        names = self._config.trusted_docker_containers
         if not names:
             return {}
         try:
@@ -210,23 +210,97 @@ class NetworkMonitor(BaseMonitor):
             result[parts[0]] = (_parse_docker_size(halves[0]), _parse_docker_size(halves[1]))
         return result
 
-    def _trusted_docker_delta(self) -> tuple[int, int]:
-        """Best-effort (recv_bytes, sent_bytes) moved by trusted containers since the last poll.
+    def _trusted_unit_stats(self) -> dict[str, tuple[int, int]]:
+        """Cumulative (ingress, egress) bytes per trusted systemd unit (IPAccounting)."""
+        result: dict[str, tuple[int, int]] = {}
+        for unit in self._config.trusted_systemd_units:
+            try:
+                out = subprocess.check_output(
+                    ["systemctl", "show", "-p", "IPIngressBytes", "-p", "IPEgressBytes", unit],
+                    text=True, stderr=subprocess.DEVNULL, timeout=5,
+                )
+            except Exception:
+                continue
+            props = dict(line.split("=", 1) for line in out.splitlines() if "=" in line)
+            try:
+                result[unit] = (int(props["IPIngressBytes"]), int(props["IPEgressBytes"]))
+            except (KeyError, ValueError):
+                # "[no data]": IPAccounting isn't enabled on the unit
+                self._logger.debug("No IP accounting data for %s", unit)
+        return result
 
-        Containers sharing a network namespace (common for a VPN + torrent client setup,
-        e.g. `network_mode: service:gluetun`) report identical cumulative NetIO — summing
-        them would double-count the same underlying bytes, so this takes the max delta
-        across trusted containers instead.
+    def _trusted_delta(self) -> tuple[int, int, dict[str, tuple[int, int]]]:
+        """(recv_bytes, sent_bytes, per-source deltas) moved by trusted sources since the last poll.
+
+        Containers sharing a network namespace (`network_mode: service:gluetun`)
+        report identical cumulative NetIO, so sources with identical counters
+        are counted once. A source whose counters went down (restarted) counts
+        as zero for that poll.
         """
-        current = self._trusted_docker_stats()
-        recv_delta = sent_delta = 0
-        for name, (rx, tx) in current.items():
-            prev = self._prev_docker_bytes.get(name)
-            if prev is not None:
-                recv_delta = max(recv_delta, rx - prev[0])
-                sent_delta = max(sent_delta, tx - prev[1])
-        self._prev_docker_bytes = current
-        return max(0, recv_delta), max(0, sent_delta)
+        current = {**self._trusted_docker_stats(), **self._trusted_unit_stats()}
+        per_source: dict[str, tuple[int, int]] = {}
+        seen_counters: set[tuple[int, int]] = set()
+        recv = sent = 0
+        for name, counters in current.items():
+            prev = self._prev_trusted_bytes.get(name)
+            if prev is None:
+                continue
+            d_recv = max(0, counters[0] - prev[0])
+            d_sent = max(0, counters[1] - prev[1])
+            per_source[name] = (d_recv, d_sent)
+            if counters in seen_counters:
+                continue
+            seen_counters.add(counters)
+            recv += d_recv
+            sent += d_sent
+        self._prev_trusted_bytes = current
+        return recv, sent, per_source
+
+    async def _fire_data_volume(
+        self,
+        direction: str,
+        rate: float,
+        held: float,
+        total: int,
+        trusted: int,
+        unexplained: int,
+        per_source: dict[str, tuple[int, int]],
+    ) -> None:
+        outbound = direction == "sent"
+        idx = 1 if outbound else 0
+        threshold = self._config.data_volume_threshold_mb
+        busy = sorted(
+            ((name, d[idx]) for name, d in per_source.items() if d[idx] >= 1_000_000),
+            key=lambda x: -x[1],
+        )
+        trusted_str = ", ".join(f"{n} {b / 1_000_000:.0f} MB" for n, b in busy) or "none"
+        conns = self._get_connections()
+        conn_str = await self._format_connections(
+            conns, **({"total_sent_bytes": unexplained} if outbound else {"total_recv_bytes": unexplained}),
+        )
+        noun = "outbound" if outbound else "inbound"
+        await self._alerts.fire(Alert(
+            rule_id="data_volume_anomaly" if outbound else "data_volume_anomaly_recv",
+            severity=Severity.WARN,
+            title=f"Unexplained {noun} data: {rate:.0f} MB/min for {held / 60:.0f} min",
+            message=(
+                f"{rate:.0f} MB/min {noun} not accounted for by trusted sources, "
+                f"for {held / 60:.0f} min (threshold: {threshold:.0f} MB/min for "
+                f"{self._config.data_volume_sustained_seconds / 60:.0f} min)\n"
+                f"Last interval: {total / 1_000_000:.1f} MB total, "
+                f"{trusted / 1_000_000:.1f} MB trusted ({trusted_str}), "
+                f"{unexplained / 1_000_000:.1f} MB unexplained"
+                + (f"\n{conn_str}" if conn_str else "")
+            ),
+            source_monitor=self.name,
+            context={
+                "direction": direction,
+                "rate_mb_min": rate,
+                "held_s": held,
+                "unexplained_bytes": unexplained,
+                "remote_ips": list({c["raddr"] for c in conns}),
+            },
+        ))
 
     def _is_trusted_addr(self, addr: str) -> bool:
         try:
@@ -242,71 +316,42 @@ class NetworkMonitor(BaseMonitor):
         return False
 
     async def _check_data_volume(self) -> None:
+        """Alert when *unexplained* traffic stays high.
+
+        Unexplained = traffic on the external interfaces minus what trusted
+        containers and systemd units moved in the same interval. It must stay
+        over data_volume_threshold_mb (MB/min) for data_volume_sustained_seconds,
+        and each episode alerts once; it re-arms after dropping back under.
+        """
         sent_bytes, recv_bytes = self._external_net_io_counters()
         now = time.monotonic()
-        if self._prev_net_bytes and self._prev_net_time:
+        # Read every poll, so the trusted counters cover the same interval.
+        trusted_recv, trusted_sent, per_source = self._trusted_delta()
+        if self._prev_net_bytes is not None and self._prev_net_time is not None:
             elapsed = now - self._prev_net_time
             if elapsed > 0:
-                sent_mb = (sent_bytes - self._prev_net_bytes["sent"]) / 1_000_000
-                recv_mb = (recv_bytes - self._prev_net_bytes["recv"]) / 1_000_000
-                sent_rate = sent_mb / elapsed * 60
-                recv_rate = recv_mb / elapsed * 60
-                threshold = self._config.data_volume_threshold_mb
-
-                over_send = sent_rate > threshold
-                over_recv = recv_rate > threshold
-
-                trusted_recv, trusted_sent = self._trusted_docker_delta()
-                if over_send and trusted_sent >= sent_mb * 1_000_000 * _CONTAINER_SUPPRESS_RATIO:
-                    self._logger.info(
-                        "Suppressing data_volume_anomaly: %.1f MB attributed to trusted containers",
-                        trusted_sent / 1_000_000,
+                total = {
+                    "sent": max(0, sent_bytes - self._prev_net_bytes["sent"]),
+                    "recv": max(0, recv_bytes - self._prev_net_bytes["recv"]),
+                }
+                trusted = {"sent": trusted_sent, "recv": trusted_recv}
+                directions = ["sent"] + (["recv"] if self._config.alert_on_inbound else [])
+                for d in directions:
+                    unexplained = max(0, total[d] - trusted[d])
+                    rate = unexplained / 1_000_000 / elapsed * 60
+                    if rate <= self._config.data_volume_threshold_mb:
+                        self._over_since[d] = None
+                        self._episode_alerted[d] = False
+                        continue
+                    if self._over_since[d] is None:
+                        self._over_since[d] = now - elapsed
+                    held = now - self._over_since[d]
+                    if held < self._config.data_volume_sustained_seconds or self._episode_alerted[d]:
+                        continue
+                    self._episode_alerted[d] = True
+                    await self._fire_data_volume(
+                        d, rate, held, total[d], trusted[d], unexplained, per_source,
                     )
-                    over_send = False
-                if over_recv and trusted_recv >= recv_mb * 1_000_000 * _CONTAINER_SUPPRESS_RATIO:
-                    self._logger.info(
-                        "Suppressing data_volume_anomaly_recv: %.1f MB attributed to trusted containers",
-                        trusted_recv / 1_000_000,
-                    )
-                    over_recv = False
-
-                if over_send or over_recv:
-                    conns = self._get_connections()
-                    remote_ips = list({c["raddr"] for c in conns})
-                    if over_send:
-                        conn_str = await self._format_connections(
-                            conns,
-                            total_sent_bytes=int(sent_mb * 1_000_000),
-                        )
-                        await self._alerts.fire(Alert(
-                            rule_id="data_volume_anomaly",
-                            severity=Severity.WARN,
-                            title=f"High outbound data: {sent_mb:.1f} MB in {elapsed:.0f}s",
-                            message=(
-                                f"System sent {sent_mb:.1f} MB in {elapsed:.0f}s "
-                                f"({sent_rate:.1f} MB/min, threshold: {threshold} MB/min)"
-                                + (f"\n{conn_str}" if conn_str else "")
-                            ),
-                            source_monitor=self.name,
-                            context={"sent_mb": sent_mb, "elapsed_s": elapsed, "remote_ips": remote_ips},
-                        ))
-                    if over_recv:
-                        conn_str = await self._format_connections(
-                            conns,
-                            total_recv_bytes=int(recv_mb * 1_000_000),
-                        )
-                        await self._alerts.fire(Alert(
-                            rule_id="data_volume_anomaly_recv",
-                            severity=Severity.WARN,
-                            title=f"High inbound data: {recv_mb:.1f} MB in {elapsed:.0f}s",
-                            message=(
-                                f"System received {recv_mb:.1f} MB in {elapsed:.0f}s "
-                                f"({recv_rate:.1f} MB/min, threshold: {threshold} MB/min)"
-                                + (f"\n{conn_str}" if conn_str else "")
-                            ),
-                            source_monitor=self.name,
-                            context={"recv_mb": recv_mb, "elapsed_s": elapsed, "remote_ips": remote_ips},
-                        ))
         self._snapshot_connections()
         self._prev_net_bytes = {
             "sent": sent_bytes,
