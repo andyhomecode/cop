@@ -51,6 +51,10 @@ def setup_logging(level: str) -> None:
         format="%(asctime)s %(name)-30s %(levelname)-8s %(message)s",
         datefmt="%Y-%m-%dT%H:%M:%S",
     )
+    # httpx logs every request URL at INFO, and Telegram Bot API URLs contain
+    # the bot token, so it ended up in the journal. Keep only its warnings.
+    for name in ("httpx", "httpcore"):
+        logging.getLogger(name).setLevel(logging.WARNING)
 
 
 def build_monitors(config: CopConfig, baseline: BaselineDB, engine: AlertEngine) -> list:
