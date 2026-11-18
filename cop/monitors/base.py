@@ -19,12 +19,14 @@ _SS_BYTES_SENT_RE = re.compile(r'\bbytes_sent:(\d+)\b')
 _SS_BYTES_RECV_RE = re.compile(r'\bbytes_received:(\d+)\b')
 _SS_USERS_RE = re.compile(r'users:\(\("([^"]+)",pid=(\d+)')
 
-# Interface name prefixes for loopback and container-internal networking (Docker
-# bridges, veth pairs). Traffic on these never leaves the host, so it's excluded
-# from system-wide send/recv totals — otherwise a busy Docker host's internal
-# container-to-container traffic (e.g. an app talking to its own DB) gets counted
-# the same as real internet egress/ingress.
-_INTERNAL_IFACE_PREFIXES = ("lo", "docker", "br-", "veth")
+# Interfaces excluded from system-wide send/recv totals:
+# - loopback and container-internal networking (Docker bridges, veth pairs):
+#   that traffic never leaves the host.
+# - tunnels and VM bridges (Tailscale, WireGuard, libvirt virbr*/vnet*): their
+#   traffic leaves through a physical interface too (encrypted, or NATed), so
+#   counting both doubles it. Tailscale's share of the physical traffic can be
+#   subtracted by trusting tailscaled.service (IPAccounting).
+_INTERNAL_IFACE_PREFIXES = ("lo", "docker", "br-", "veth", "tailscale", "wg", "virbr", "vnet")
 
 # Shared across all monitor instances for the daemon's lifetime
 _IP_CACHE: dict[str, str] = {}
@@ -85,6 +87,19 @@ class BaseMonitor(ABC):
     @abstractmethod
     async def learn(self) -> None:
         """Snapshot current state into baseline DB."""
+
+    async def mark_expected(self, alert) -> str:
+        """Telegram "Mark Expected". Monitors override this per rule: remember
+        what's safe to remember, and only acknowledge what must keep alerting.
+        Returns the reply shown in the chat."""
+        return "👍 Acknowledged. Nothing to remember for this kind of alert."
+
+    async def _approved(self, kind: str) -> set[str]:
+        try:
+            return {a["value"] for a in await self._baseline.get_approvals(kind)}
+        except Exception:
+            self._logger.exception("Could not load %s approvals", kind)
+            return set()
 
     def _external_net_io_counters(self) -> tuple[int, int]:
         """Cumulative (bytes_sent, bytes_recv) across real external interfaces only.
@@ -153,8 +168,16 @@ class BaseMonitor(ABC):
                     "pid": int(users_m.group(2)),
                 }
 
-    async def _sleep_sampling(self, duration: float, step: float = 5.0) -> None:
-        """Sleep for duration while refreshing the proc cache every step seconds."""
+    async def _sleep_sampling(self, duration: float, step: float = 5.0, sample: bool = True) -> None:
+        """Sleep for duration, refreshing the proc cache every step seconds if sample.
+
+        Each refresh runs `ss -p` (~30 ms of CPU, mostly kernel time walking
+        every process's fds), so callers sample only while a traffic alert may
+        need connection attribution.
+        """
+        if not sample:
+            await asyncio.sleep(duration)
+            return
         remaining = duration
         while remaining > 0 and self._running:
             await asyncio.sleep(min(step, remaining))
@@ -313,26 +336,16 @@ class BaseMonitor(ABC):
             if raddr and raddr not in g["raddrs"]:
                 g["raddrs"].append(raddr)
 
-        # Estimate unattributed bytes and distribute among closed-connection groups.
-        # Closed sockets lose their ss byte stats; this gives them a realistic sort rank.
-        total_attributed_sent = sum(g["bytes_sent"] for g in groups.values())
-        total_attributed_recv = sum(g["bytes_received"] for g in groups.values())
-        unattr_sent = max(0, total_sent_bytes - total_attributed_sent)
-        unattr_recv = max(0, total_recv_bytes - total_attributed_recv)
-        total_closed = sum(g["closed"] for g in groups.values())
-        for g in groups.values():
-            if total_closed > 0 and g["closed"] > 0:
-                g["est_sent"] = int(unattr_sent * g["closed"] / total_closed)
-                g["est_recv"] = int(unattr_recv * g["closed"] / total_closed)
-            else:
-                g["est_sent"] = 0
-                g["est_recv"] = 0
+        # Bytes on the interfaces that no open connection accounts for (closed
+        # sockets lose their counters, UDP isn't in ss -t). Shown as one line
+        # rather than guessed onto a process.
+        total_attributed = sum(g["bytes_sent"] + g["bytes_received"] for g in groups.values())
+        unattributed = max(0, total_sent_bytes + total_recv_bytes - total_attributed)
 
         sorted_groups = sorted(
             groups.items(),
             key=lambda kv: (
-                kv[1]["bytes_sent"] + kv[1]["bytes_received"]
-                + kv[1]["est_sent"] + kv[1]["est_recv"],
+                kv[1]["bytes_sent"] + kv[1]["bytes_received"],
                 kv[1]["count"],
             ),
             reverse=True,
@@ -371,9 +384,6 @@ class BaseMonitor(ABC):
                 size_parts.append(f"↑{_fmt_bytes(g['bytes_sent'])}")
             if g["bytes_received"]:
                 size_parts.append(f"↓{_fmt_bytes(g['bytes_received'])}")
-            est_total = g["est_sent"] + g["est_recv"]
-            if est_total:
-                size_parts.append(f"~{_fmt_bytes(est_total)}")
             if g["closed"]:
                 size_parts.append(f"{g['closed']} closed")
             size_str = f" [{', '.join(size_parts)}]" if size_parts else ""
@@ -399,6 +409,8 @@ class BaseMonitor(ABC):
         extra_procs = len(sorted_groups) - limit
         if extra_procs > 0:
             lines.append(f"  +{extra_procs} more process{'es' if extra_procs != 1 else ''}")
+        if unattributed >= 1_000_000:
+            lines.append(f"  Not attributable to a connection: {_fmt_bytes(unattributed)} (closed sockets, UDP, forwarded traffic)")
         return "\n".join(lines)
 
     async def _enrich_ip(self, ip: str) -> str:

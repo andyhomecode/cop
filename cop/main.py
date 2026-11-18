@@ -13,6 +13,7 @@ from cop.config import CopConfig, NtfyConfig
 from cop.ollama import OllamaScorer
 from cop.monitors.auth import AuthMonitor
 from cop.monitors.docker_ import DockerMonitor
+from cop.monitors.execmon import ExecMonitor
 from cop.monitors.file import FileMonitor
 from cop.monitors.kernel import KernelMonitor
 from cop.monitors.tripwire import TripwireMonitor
@@ -62,7 +63,11 @@ def build_monitors(config: CopConfig, baseline: BaselineDB, engine: AlertEngine)
     poll = config.general.poll_interval_seconds
     monitors = []
     if m.process.enabled:
-        monitors.append(ProcessMonitor(m.process, baseline, engine, poll_interval=poll))
+        monitors.append(ProcessMonitor(
+            m.process, baseline, engine, poll_interval=poll,
+            known_containers=m.docker.known_containers,
+            public_containers=m.exec.public_containers,
+        ))
     if m.network.enabled:
         monitors.append(NetworkMonitor(m.network, baseline, engine, poll_interval=poll))
     if m.resource.enabled:
@@ -81,12 +86,37 @@ def build_monitors(config: CopConfig, baseline: BaselineDB, engine: AlertEngine)
         monitors.append(KernelMonitor(m.kernel, baseline, engine))
     if m.tripwire.enabled:
         monitors.append(TripwireMonitor(m.tripwire, baseline, engine))
+    if m.exec.enabled:
+        execmon = ExecMonitor(
+            m.exec, baseline, engine,
+            suspicious_parent_names=m.process.suspicious_parent_names,
+            shell_names=m.process.shell_names,
+        )
+        monitors.append(execmon)
+        # Tripwires use auditd too when it's available: exact process attribution
+        for mon in monitors:
+            if isinstance(mon, TripwireMonitor):
+                mon.audit_source = execmon
     return monitors
+
+
+async def _prune_loop(db: BaselineDB, retention_days: int, logger: logging.Logger) -> None:
+    """Delete alert history older than retention_days now and then daily."""
+    while True:
+        try:
+            n = await db.prune_alerts(retention_days)
+            if n:
+                logger.info("Pruned %d alert rows older than %d days", n, retention_days)
+        except Exception:
+            logger.exception("Alert history pruning failed")
+        await asyncio.sleep(86400)
 
 
 async def run_daemon(config: CopConfig) -> None:
     setup_logging(config.general.log_level)
     logger = logging.getLogger("cop.main")
+    for w in config.warnings:
+        logger.warning("Config: %s", w)
 
     config.data_path.mkdir(parents=True, exist_ok=True)
 
@@ -124,12 +154,15 @@ async def run_daemon(config: CopConfig) -> None:
                 return
 
             tasks = [await m.start() for m in monitors]
+            prune_task = asyncio.create_task(_prune_loop(db, config.alerts.retention_days, logger))
             logger.info("cop started with %d monitors: %s", len(monitors), [m.name for m in monitors])
             if config.config_path:
                 mtime = datetime.datetime.fromtimestamp(config.config_path.stat().st_mtime).strftime("%Y-%m-%dT%H:%M:%S")
                 config_info = f"config: {config.config_path} (modified {mtime})"
             else:
                 config_info = "config: defaults (no file found)"
+            if config.warnings:
+                config_info += "\n⚠️ config warnings:\n" + "\n".join(f"- {w}" for w in config.warnings)
             await _ntfy_notify(session, config.ntfy, "cop started", f"{len(monitors)} monitors active\n{config_info}", tags="white_check_mark")
             if telegram_sink is not None:
                 await telegram_sink.send_text(f"✅ cop started\n{len(monitors)} monitors active\n{config_info}")
@@ -149,6 +182,7 @@ async def run_daemon(config: CopConfig) -> None:
             if telegram_sink is not None:
                 await telegram_sink.send_text("🛑 cop stopping")
             await _ntfy_notify(session, config.ntfy, "cop stopped", "Daemon shutting down", tags="zzz")
+            prune_task.cancel()
             logger.info("Stopping monitors...")
             for m in monitors:
                 await m.stop()
@@ -195,6 +229,11 @@ async def show_baseline(config: CopConfig, table: str) -> None:
             print(f"\n=== Containers ({len(containers)}) ===")
             for c in containers:
                 print(f"  {c['name']:30}  {c['image']}")
+        if table in ("approvals", "all"):
+            approvals = await db.get_approvals()
+            print(f"\n=== Mark Expected approvals ({len(approvals)}) ===")
+            for a in approvals:
+                print(f"  {a['kind']:22}  {a['value']:50}  {a['created_at'][:16]}")
 
 
 async def show_alerts(config: CopConfig, limit: int, severity: str | None) -> None:

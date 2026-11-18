@@ -50,7 +50,7 @@ def baseline() -> None:
 @baseline.command(name="show")
 @click.option(
     "--table",
-    type=click.Choice(["processes", "ports", "containers", "all"]),
+    type=click.Choice(["processes", "ports", "containers", "approvals", "all"]),
     default="all",
     show_default=True,
 )

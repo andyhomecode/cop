@@ -8,12 +8,12 @@ general:
   poll_interval_seconds: 30             # how often process + network monitors poll
 
 alerts:
-  dedup_window_seconds: 300             # suppress identical rule_id within this window
+  dedup_window_seconds: 300             # hold back repeats of the same rule + subject (file, user, port...) within this window
   rule_cooldowns:                       # per-rule overrides (seconds)
     new_root_process: 600
     new_listen_port: 3600
     ssh_brute_force: 60
-    crypto_cpu: 300
+  retention_days: 90                    # delete alert history older than this (0 = keep forever)
 
 ntfy:
   enabled: true
@@ -75,8 +75,8 @@ monitors:
     enabled: true
     # Ports to treat as always-known (never fire new_listen_port for these)
     baseline_ports_override: []
-    # Window (seconds) over which outbound bytes are summed for data_volume_anomaly
-    data_volume_window_seconds: 60
+    # Loopback ports in the ephemeral range are client callbacks, not services
+    ignore_loopback_ephemeral_ports: true
     # data_volume_anomaly: alert when *unexplained* outbound traffic (total minus
     # trusted containers and units below) stays over this many MB/min for
     # data_volume_sustained_seconds. One alert per episode.
@@ -84,16 +84,6 @@ monitors:
     data_volume_sustained_seconds: 300
     # Also alert on unexplained inbound volume (data_volume_anomaly_recv)
     alert_on_inbound: false
-    # Outbound connections to these CIDRs are not flagged
-    trusted_cidrs:
-      - "127.0.0.0/8"
-      - "::1/128"
-      - "100.64.0.0/10"    # Tailscale CGNAT
-      - "192.168.0.0/16"
-      - "10.0.0.0/8"
-    trusted_process_names:
-      - tailscaled
-      - systemd-resolved
     # Containers whose traffic is subtracted before checking data_volume_anomaly.
     # Read via `docker stats`; containers sharing a network namespace
     # (network_mode: service:X) are counted once. Only trust containers whose
@@ -107,39 +97,36 @@ monitors:
     trusted_systemd_units: []
     # Example:
     #   - dropboxd@dropboxsync.service
+    #   - tailscaled.service   # exit node / backups over Tailscale (tailscale0 itself isn't counted)
 
   file:
     enabled: true
-    watch_paths:
-      - "~/.ssh"
-      - "/etc"
-      - "/home"
-      - "/var/run/docker.sock"
-      # Add additional paths as needed:
-      # - "/mnt/data/Dropbox"
+    # watch_paths replaces the default list (~/.ssh, /root/.ssh, /etc, /home,
+    # /var/run/docker.sock); extra_watch_paths adds to it. Prefer the extra_ lists.
+    extra_watch_paths: []
+      # - "/usr/local/sbin"
+      # Avoid personal-file trees (e.g. a Dropbox folder): lots of noise, no security signal.
     ignore_patterns:                       # matched against filename only
       - "*.swp"
       - "*.tmp"
       - "*~"
-      - ".dropbox"
       - "*.pyc"
     ignore_paths:                          # matched as path prefixes (full path)
       []
       # Examples:
-      # - "/mnt/data/Dropbox/.dropbox.cache"
       # - "/etc/cups"
     alert_on_events:
       - created
       - modified
       - deleted
       - moved
-    # Any write to these paths fires CRITICAL instead of WARN
-    critical_paths:
-      - "~/.ssh/authorized_keys"
-      - "/etc/passwd"
-      - "/etc/shadow"
-      - "/etc/sudoers"
-      - "/etc/ssh/sshd_config"
+    # Writes to these fire CRITICAL instead of WARN, on top of the built-in list
+    # (authorized_keys, passwd/shadow/group/gshadow, sudoers(.d), sshd_config(.d),
+    # pam.d, ld.so.preload, profile.d, bash.bashrc, environment). Globs; * spans /.
+    extra_critical_paths: []
+      # - "/usr/local/sbin/*"
+    # Skip non-critical events while apt/dpkg runs (PackageMonitor reports it)
+    quiet_during_package_ops: true
 
   docker:
     enabled: true
@@ -159,6 +146,13 @@ monitors:
     known_ssh_sources:
       - "100.64.0.0/10"                 # Tailscale
       - "127.0.0.1"
+      # - "192.168.1.0/24"              # your LAN
+    # SSH logins by these users fire CRITICAL ssh_login_outside_window unless
+    # they match one of login_windows (UTC; hours are [start, end)).
+    restricted_login_users: []
+      # - root
+    login_windows: []
+      # - {user: root, source: "100.64.0.10", days: [sun], hours: [9, 14]}
     known_sudo_users:
       - root
       # - youruser
@@ -179,7 +173,41 @@ monitors:
       # - "/root/.ssh/id_rsa"           # Only add if you don't actually use this key
       # - "/root/.docker/config.json"   # Docker Hub auth token
       # - "/var/www/html/wp-config.php" # WordPress DB credentials
-    create_missing: true                # Create empty decoy files that don't already exist
+      # Bait with believable fake contents (attackers love password.txt):
+      # - path: "/home/youruser/password.txt"
+      #   owner: youruser
+      #   mode: "600"
+      #   content: |
+      #     passwords - move these into the password manager
+      #     router admin   admin / (made-up)
+    create_missing: true                # Create decoy files that don't already exist (empty unless content)
+    # With monitors.exec enabled, opens are detected through auditd and name the
+    # exact process and user. List legitimate readers (backups, indexers, Samba):
+    allowed_readers: []
+      # - "rsync@root"
+      # - "smbd"
+
+  package:
+    enabled: true
+    # One alert per apt/dpkg run: WARN if anything was installed or removed,
+    # INFO (silent) if it only upgraded. A run ends after this long with no
+    # dpkg activity; unattended-upgrades' back-to-back sessions become one run.
+    summary_quiet_seconds: 60
+    alert_on_install: true
+    alert_on_remove: true
+    ignored_packages: []
+
+  exec:
+    # Every program start, from auditd. Needs the execve rule in the README
+    # (ExecMonitor → Setup) loaded with the key below.
+    enabled: false
+    audit_key: cop_exec
+    # Internet-facing containers: a shell/downloader started by the app itself
+    # is CRITICAL (container_suspicious_exec)
+    public_containers: []
+      # - my-reverse-proxy
+      # - my-web-app
+    temp_exec_allow: []   # globs of programs allowed to run from /tmp, /var/tmp, /dev/shm
 
   resource:
     enabled: true

@@ -138,7 +138,7 @@ async def test_rule_specific_cooldown_respected(engine, mock_sink):
     # ssh_brute_force has 60s cooldown (shorter than global 300s)
     await engine.fire(make_alert("ssh_brute_force", Severity.CRITICAL))
     # Wind back last_fired to 59s ago — still inside 60s cooldown
-    engine._last_fired["ssh_brute_force"] = datetime.now(timezone.utc) - timedelta(seconds=59)
+    engine._last_fired[("ssh_brute_force", "")] = datetime.now(timezone.utc) - timedelta(seconds=59)
     fired = await engine.fire(make_alert("ssh_brute_force", Severity.CRITICAL))
     assert fired is False
 
@@ -147,23 +147,52 @@ async def test_rule_specific_cooldown_respected(engine, mock_sink):
 async def test_alert_fires_after_cooldown_expires(engine, mock_sink):
     await engine.fire(make_alert("ssh_brute_force", Severity.CRITICAL))
     # Wind back to 61s ago — past the 60s cooldown
-    engine._last_fired["ssh_brute_force"] = datetime.now(timezone.utc) - timedelta(seconds=61)
+    engine._last_fired[("ssh_brute_force", "")] = datetime.now(timezone.utc) - timedelta(seconds=61)
     fired = await engine.fire(make_alert("ssh_brute_force", Severity.CRITICAL))
     assert fired is True
     assert mock_sink.send.call_count == 2
 
 
 @pytest.mark.asyncio
-async def test_alert_recorded_even_when_deduped(engine, mock_db):
+async def test_deduped_repeat_not_recorded_but_counted(engine, mock_db, mock_sink):
     await engine.fire(make_alert())
-    await engine.fire(make_alert())  # deduped
-    assert mock_db.record_alert.call_count == 2
-    # Second call should have deduped=True
-    _, kwargs = mock_db.record_alert.call_args_list[1]
-    # record_alert is called with positional args via await
-    call_args = mock_db.record_alert.call_args_list[1]
-    # deduped is the 9th positional arg
-    assert call_args.kwargs.get("deduped", call_args.args[8] if len(call_args.args) > 8 else None)
+    await engine.fire(make_alert())  # held back: not stored, not sent
+    await engine.fire(make_alert())
+    assert mock_db.record_alert.call_count == 1
+    engine._last_fired[("test_rule", "")] = datetime.now(timezone.utc) - timedelta(seconds=301)
+    a = make_alert()
+    assert await engine.fire(a) is True
+    assert a.context["repeats_suppressed"] == 2
+    assert "+2 repeats held back" in a.message
+
+
+@pytest.mark.asyncio
+async def test_same_rule_different_subject_not_deduped(engine, mock_sink):
+    """Four users created in a row must give four alerts, not one."""
+    for name in ("a", "b", "c", "d"):
+        await engine.fire(Alert(
+            rule_id="new_system_user", severity=Severity.CRITICAL, title=name,
+            message=name, source_monitor="AuthMonitor", context={"username": name},
+        ))
+    assert mock_sink.send.call_count == 4
+
+
+@pytest.mark.asyncio
+async def test_same_subject_deduped(engine, mock_sink):
+    for _ in range(3):
+        await engine.fire(Alert(
+            rule_id="file_modified", severity=Severity.WARN, title="t", message="m",
+            source_monitor="FileMonitor", context={"src_path": "/etc/x", "dest_path": ""},
+        ))
+    assert mock_sink.send.call_count == 1
+
+
+def test_subject_prefers_move_destination():
+    from cop.alerts import alert_subject
+    a = Alert(rule_id="file_moved", severity=Severity.WARN, title="t", message="m",
+              source_monitor="FileMonitor",
+              context={"src_path": "/etc/passwd+", "dest_path": "/etc/passwd"})
+    assert alert_subject(a) == "dest_path=/etc/passwd"
 
 
 def make_scorer():

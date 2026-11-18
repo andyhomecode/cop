@@ -19,6 +19,7 @@ class ResourceMonitor(BaseMonitor):
 
     def __init__(self, config: ResourceMonitorConfig, baseline, alert_engine):
         super().__init__(config, baseline, alert_engine)
+        self._approved_cpu: set[str] = set()  # process names marked expected
         # pid -> deque of (monotonic_time, cpu_percent)
         self._cpu_history: dict[int, deque] = {}
         self._prev_net_io = None
@@ -27,7 +28,16 @@ class ResourceMonitor(BaseMonitor):
         self._last_net_sent_bytes: int = 0
         self._last_net_recv_bytes: int = 0
 
+    async def mark_expected(self, alert) -> str:
+        name = alert.context.get("name")
+        if alert.rule_id == "high_cpu_sustained" and name:
+            await self._baseline.add_approval("cpu_process", name)
+            self._approved_cpu.add(name)
+            return f"✅ {name} may use sustained high CPU; it won't alert again."
+        return await super().mark_expected(alert)
+
     async def run(self) -> None:
+        self._approved_cpu = await self._approved("cpu_process")
         # Prime cpu_percent so second call returns real values
         psutil.cpu_percent(interval=None)
         for proc in psutil.process_iter(["pid"]):
@@ -45,15 +55,13 @@ class ResourceMonitor(BaseMonitor):
                 await self._check_per_process_cpu()
                 await self._check_memory(mem_pct)
                 await self._check_network(send_mbps, recv_mbps)
-                await self._baseline.add_resource_sample({
-                    "cpu_percent": cpu_pct,
-                    "mem_percent": mem_pct,
-                    "net_send_mbps": send_mbps,
-                    "net_recv_mbps": recv_mbps,
-                })
             except Exception:
                 self._logger.exception("Error in resource check cycle")
-            await self._sleep_sampling(self._config.check_interval_seconds)
+            # Connection sampling (ss -p every 5 s) only feeds the raw network
+            # alerts' process attribution, so skip it while those are off.
+            await self._sleep_sampling(
+                self._config.check_interval_seconds, sample=self._config.net_alerts_enabled,
+            )
 
     async def learn(self) -> None:
         psutil.cpu_percent(interval=None)
@@ -72,13 +80,14 @@ class ResourceMonitor(BaseMonitor):
 
     async def _check_per_process_cpu(self) -> None:
         now = time.monotonic()
-        for proc in psutil.process_iter(["pid", "name", "username"]):
+        live_pids: set[int] = set()
+        for proc in psutil.process_iter(["pid", "name"]):
+            live_pids.add(proc.pid)
             try:
                 pname = proc.info["name"] or ""
-                if pname in self._config.resource_whitelist:
+                if pname in self._config.resource_whitelist or pname in self._approved_cpu:
                     continue
                 pid = proc.info["pid"]
-                pusername = proc.info.get("username") or "?"
                 cpu = proc.cpu_percent(interval=None)
                 if pid not in self._cpu_history:
                     self._cpu_history[pid] = deque()
@@ -94,6 +103,10 @@ class ResourceMonitor(BaseMonitor):
                     and window >= self._config.cpu_sustained_seconds
                     and all(s[1] >= self._config.cpu_threshold_percent for s in samples)
                 ):
+                    try:
+                        pusername = proc.username()  # only when alerting: a pwd lookup per process adds up
+                    except (psutil.NoSuchProcess, psutil.AccessDenied, KeyError):
+                        pusername = "?"
                     await self._alerts.fire(Alert(
                         rule_id="high_cpu_sustained",
                         severity=Severity.WARN,
@@ -109,7 +122,6 @@ class ResourceMonitor(BaseMonitor):
             except (psutil.NoSuchProcess, psutil.AccessDenied):
                 pass
 
-        live_pids = {p.pid for p in psutil.process_iter(["pid"])}
         self._cpu_history = {pid: v for pid, v in self._cpu_history.items() if pid in live_pids}
 
     async def _check_memory(self, mem_pct: float) -> None:
@@ -185,11 +197,13 @@ class ResourceMonitor(BaseMonitor):
                 recv_mbps = recv_b * 8 / 1_000_000 / elapsed
                 self._prev_net_io = counters
                 self._prev_net_time = now
-                self._snapshot_connections()
+                if self._config.net_alerts_enabled:
+                    self._snapshot_connections()
                 return send_mbps, recv_mbps
         self._last_net_sent_bytes = 0
         self._last_net_recv_bytes = 0
         self._prev_net_io = counters
         self._prev_net_time = now
-        self._snapshot_connections()
+        if self._config.net_alerts_enabled:
+            self._snapshot_connections()
         return 0.0, 0.0

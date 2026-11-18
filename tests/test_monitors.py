@@ -111,23 +111,34 @@ class TestProcessMonitor:
 
 
 class TestNetworkMonitor:
-    def test_loopback_is_trusted(self, mock_baseline, mock_engine):
-        config = NetworkMonitorConfig(trusted_cidrs=["127.0.0.0/8", "::1/128", "100.64.0.0/10"])
-        monitor = NetworkMonitor(config, mock_baseline, mock_engine)
-        assert monitor._is_trusted_addr("127.0.0.1") is True
-        assert monitor._is_trusted_addr("127.0.0.50") is True
-        assert monitor._is_trusted_addr("::1") is True
+    def test_alertable_addresses(self):
+        from cop.monitors.network import _is_alertable_addr
+        for addr in ("0.0.0.0", "::", "127.0.0.1", "::1", "192.168.1.10", "172.18.0.1"):
+            assert _is_alertable_addr(addr) is True, addr
+        for addr in ("100.100.1.2", "fd7a:115c:a1e0::1", "fe80::1%eno2", "169.254.1.1"):
+            assert _is_alertable_addr(addr) is False, addr
 
-    def test_tailscale_is_trusted(self, mock_baseline, mock_engine):
-        config = NetworkMonitorConfig(trusted_cidrs=["100.64.0.0/10"])
-        monitor = NetworkMonitor(config, mock_baseline, mock_engine)
-        assert monitor._is_trusted_addr("100.75.2.112") is True
+    @pytest.mark.asyncio
+    async def test_loopback_ephemeral_port_ignored_lan_port_alerts(self, mock_baseline, mock_engine):
+        monitor = NetworkMonitor(NetworkMonitorConfig(), mock_baseline, mock_engine)
+        ports = [
+            {"proto": "tcp", "local_addr": "127.0.0.1", "local_port": 45847, "pid": 1, "process_name": "claude", "username": "andy"},
+            {"proto": "tcp", "local_addr": "192.168.1.10", "local_port": 4444, "pid": 2, "process_name": "nc", "username": "andy"},
+            {"proto": "tcp", "local_addr": "0.0.0.0", "local_port": 8096, "pid": 3, "process_name": "x", "username": "andy"},
+        ]
+        monitor._config.baseline_ports_override = [8096]
 
-    def test_external_ip_not_trusted(self, mock_baseline, mock_engine):
-        config = NetworkMonitorConfig(trusted_cidrs=["127.0.0.0/8"])
-        monitor = NetworkMonitor(config, mock_baseline, mock_engine)
-        assert monitor._is_trusted_addr("8.8.8.8") is False
-        assert monitor._is_trusted_addr("1.1.1.1") is False
+        async def stop_after_one(*a, **k):
+            monitor._running = False
+
+        with patch.object(monitor, "_get_listening_ports", return_value=ports), \
+             patch.object(monitor, "_check_data_volume", AsyncMock()), \
+             patch.object(monitor, "_check_suspicious_outbound", AsyncMock()), \
+             patch.object(monitor, "_sleep_sampling", side_effect=stop_after_one):
+            monitor._running = True
+            await monitor.run()
+        fired = [c.args[0] for c in mock_engine.fire.call_args_list]
+        assert [a.context["local_port"] for a in fired] == [4444]
 
     def test_get_listening_ports_returns_list(self, mock_baseline, mock_engine):
         monitor = NetworkMonitor(NetworkMonitorConfig(), mock_baseline, mock_engine)
@@ -203,27 +214,22 @@ class TestBaseMonitorConnections:
         assert "3.0 MB" in result or "↑3.0 MB" in result or "3,000" in result or "↑2.9 MB" in result
 
     @pytest.mark.asyncio
-    async def test_estimated_bytes_sort_closed_above_small_active(self, mock_baseline, mock_engine):
-        """Closed connections should rank above tiny ESTAB connections when total bytes are provided."""
+    async def test_unattributed_bytes_not_guessed_onto_a_process(self, mock_baseline, mock_engine):
+        """Bytes no connection accounts for are shown on their own line, never
+        pinned on a closed connection (that once read 'curl ~569 MB -> Cloudflare')."""
         monitor = NetworkMonitor(NetworkMonitorConfig(), mock_baseline, mock_engine)
         conns = [
-            # Small ESTAB connection (sshd) - has measured bytes
             {"laddr": "1.2.3.4", "lport": 22, "raddr": "192.168.1.1", "rport": 54321,
              "bytes_sent": 20_000, "bytes_received": 12_000, "process_name": "sshd", "pid": 1001},
-            # Closed connection (speedtest) - 0 measured bytes
             {"laddr": "1.2.3.4", "lport": 50000, "raddr": "34.117.59.81", "rport": 443,
-             "bytes_sent": 0, "bytes_received": 0, "closed": True},
+             "bytes_sent": 0, "bytes_received": 0, "closed": True, "process_name": "curl", "pid": 5},
         ]
-        # System sent 165 MB total; 20 KB is attributed → 165 MB estimated for closed group
         with patch.object(monitor, "_enrich_ip", return_value=""):
-            result = await monitor._format_connections(
-                conns, total_sent_bytes=165_000_000,
-            )
+            result = await monitor._format_connections(conns, total_sent_bytes=165_000_000)
         lines = result.splitlines()
-        # First data line should be the unknown (estimated ~165 MB), not sshd
-        assert "unknown" in lines[1]
-        assert "~" in lines[1]
-        assert "sshd" in lines[2]
+        assert "sshd" in lines[1]
+        assert "~" not in result
+        assert "Not attributable to a connection: 157.3 MB" in result or "Not attributable to a connection: 157" in result
 
     @pytest.mark.asyncio
     async def test_multiple_destination_ips_enriched(self, mock_baseline, mock_engine):
@@ -427,8 +433,10 @@ class TestResourceMonitor:
         monitor = ResourceMonitor(config, mock_baseline, mock_engine)
 
         fake_proc = MagicMock()
-        fake_proc.info = {"pid": 1234, "name": "hoggerd", "username": "mallory"}
+        fake_proc.pid = 1234
+        fake_proc.info = {"pid": 1234, "name": "hoggerd"}
         fake_proc.cpu_percent.return_value = 90.0
+        fake_proc.username.return_value = "mallory"  # looked up only when alerting
 
         # Pin time so that cutoff = fixed_now - 60 and we can place samples precisely.
         # The oldest sample at fixed_now - 60 is NOT pruned (prune condition is strict <).

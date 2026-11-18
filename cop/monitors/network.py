@@ -23,23 +23,46 @@ def _parse_docker_size(s: str) -> int:
 
 _LOOPBACK = ipaddress.ip_network("127.0.0.0/8")
 _LOOPBACK6 = ipaddress.ip_network("::1/128")
+# Binds on these come and go on their own (tailscaled's per-peer ports, IPv6
+# link-local), so they aren't alerted on.
+_UNALERTABLE_NETS = [
+    ipaddress.ip_network("100.64.0.0/10"),        # Tailscale (CGNAT)
+    ipaddress.ip_network("fd7a:115c:a1e0::/48"),  # Tailscale IPv6
+    ipaddress.ip_network("fe80::/10"),
+    ipaddress.ip_network("169.254.0.0/16"),
+]
 
 
 def _is_alertable_addr(addr: str) -> bool:
-    """Only alert on ports bound to public-facing or well-known addresses.
+    """Alert on ports bound anywhere except Tailscale and link-local addresses.
 
-    Skips Tailscale, LAN, and other non-canonical binds that are expected to
-    appear/disappear without being security-relevant.
+    A bind to a specific LAN address (e.g. 192.168.1.10:8090) is as reachable
+    as one on 0.0.0.0, so it counts too.
     """
     if addr in ("0.0.0.0", "::", ""):
         return True
     try:
-        ip = ipaddress.ip_address(addr)
-        if ip in _LOOPBACK or ip in _LOOPBACK6:
-            return True
+        ip = ipaddress.ip_address(addr.split("%", 1)[0])
     except ValueError:
-        pass
-    return False
+        return True
+    return not any(ip in net for net in _UNALERTABLE_NETS if ip.version == net.version)
+
+
+def _is_loopback(addr: str) -> bool:
+    try:
+        ip = ipaddress.ip_address(addr)
+    except ValueError:
+        return False
+    return ip in _LOOPBACK or ip in _LOOPBACK6
+
+
+def _ephemeral_port_range() -> tuple[int, int]:
+    try:
+        with open("/proc/sys/net/ipv4/ip_local_port_range") as f:
+            lo, hi = f.read().split()
+            return int(lo), int(hi)
+    except (OSError, ValueError):
+        return 32768, 60999
 
 from cop.alerts import Alert, Severity
 from cop.monitors.base import BaseMonitor
@@ -70,15 +93,29 @@ class NetworkMonitor(BaseMonitor):
         # whether this episode has already alerted (one alert per episode).
         self._over_since: dict[str, float | None] = {"sent": None, "recv": None}
         self._episode_alerted: dict[str, bool] = {"sent": False, "recv": False}
+        self._approved_outbound: set[str] = set()  # "process:port" from Mark Expected
 
     async def run(self) -> None:
+        self._approved_outbound = await self._approved("outbound")
         port_baseline = await self._baseline.get_port_baseline()
         known_ports: set[tuple] = {(p["proto"], p["local_port"]) for p in port_baseline}
-
+        known_ports |= {("tcp", port) for port in self._config.baseline_ports_override}
+        eph_lo, eph_hi = _ephemeral_port_range()
         while self._running:
             try:
-                for port in self._get_listening_ports():
+                try:
+                    conns = psutil.net_connections(kind="inet")  # one scan per poll, shared
+                except psutil.AccessDenied:
+                    self._logger.warning("Access denied reading net connections — need root")
+                    conns = []
+                for port in self._get_listening_ports(conns):
                     if not _is_alertable_addr(port["local_addr"]):
+                        continue
+                    if (
+                        self._config.ignore_loopback_ephemeral_ports
+                        and _is_loopback(port["local_addr"])
+                        and eph_lo <= port["local_port"] <= eph_hi
+                    ):
                         continue
                     key = (port["proto"], port["local_port"])
                     if key not in known_ports:
@@ -99,10 +136,16 @@ class NetworkMonitor(BaseMonitor):
                         known_ports.add(key)
 
                 await self._check_data_volume()
-                await self._check_suspicious_outbound()
+                await self._check_suspicious_outbound(conns)
             except Exception:
                 self._logger.exception("Error in network scan cycle")
-            await self._sleep_sampling(self._poll_interval)
+            await self._sleep_sampling(self._poll_interval, sample=self._attribution_needed())
+
+    def _attribution_needed(self) -> bool:
+        """Per-connection detail only matters for a data_volume_anomaly alert,
+        which needs data_volume_sustained_seconds over the threshold first. So
+        collect it (ss -p, ss -i) only once an episode has started."""
+        return any(t is not None for t in self._over_since.values())
 
     async def learn(self) -> None:
         ports = self._get_listening_ports()
@@ -113,13 +156,29 @@ class NetworkMonitor(BaseMonitor):
     async def learn_one(self, context: dict) -> None:
         await self._baseline.add_port_to_baseline(context)
 
-    def _get_listening_ports(self) -> list[dict]:
+    async def mark_expected(self, alert) -> str:
+        ctx = alert.context
+        if alert.rule_id == "new_listen_port":
+            await self.learn_one(ctx)
+            return f"✅ Port {ctx.get('local_port')} added to the baseline."
+        if alert.rule_id == "suspicious_outbound_port":
+            value = f"{ctx.get('process_name')}:{ctx.get('rport')}"
+            await self._baseline.add_approval("outbound", value)
+            self._approved_outbound.add(value)
+            return f"✅ {ctx.get('process_name')} connecting to port {ctx.get('rport')} won't alert again."
+        if alert.rule_id.startswith("data_volume_anomaly"):
+            return ("👍 Acknowledged. To stop these for a known source, trust it in the config: "
+                    "monitors.network.trusted_docker_containers or trusted_systemd_units.")
+        return await super().mark_expected(alert)
+
+    def _get_listening_ports(self, conns: list | None = None) -> list[dict]:
         result = []
-        try:
-            conns = psutil.net_connections(kind="inet")
-        except psutil.AccessDenied:
-            self._logger.warning("Access denied reading net connections — need root")
-            return result
+        if conns is None:
+            try:
+                conns = psutil.net_connections(kind="inet")
+            except psutil.AccessDenied:
+                self._logger.warning("Access denied reading net connections — need root")
+                return result
         for conn in conns:
             if conn.status != psutil.CONN_LISTEN:
                 continue
@@ -142,14 +201,15 @@ class NetworkMonitor(BaseMonitor):
             })
         return result
 
-    async def _check_suspicious_outbound(self) -> None:
+    async def _check_suspicious_outbound(self, conns: list | None = None) -> None:
         port_set = set(getattr(self._config, "suspicious_outbound_ports", []))
         if not port_set:
             return
-        try:
-            conns = psutil.net_connections(kind="inet")
-        except psutil.AccessDenied:
-            return
+        if conns is None:
+            try:
+                conns = psutil.net_connections(kind="inet")
+            except psutil.AccessDenied:
+                return
         for conn in conns:
             if conn.status != psutil.CONN_ESTABLISHED:
                 continue
@@ -165,6 +225,8 @@ class NetworkMonitor(BaseMonitor):
                     pass
             trusted_names = getattr(self._config, "trusted_outbound_process_names", [])
             if process_name in trusted_names:
+                continue
+            if f"{process_name}:{conn.raddr.port}" in self._approved_outbound:
                 continue
             key = (conn.pid, conn.raddr.ip, conn.raddr.port)
             if key in self._alerted_outbound:
@@ -302,19 +364,6 @@ class NetworkMonitor(BaseMonitor):
             },
         ))
 
-    def _is_trusted_addr(self, addr: str) -> bool:
-        try:
-            ip = ipaddress.ip_address(addr)
-            for cidr in self._config.trusted_cidrs:
-                try:
-                    if ip in ipaddress.ip_network(cidr, strict=False):
-                        return True
-                except ValueError:
-                    pass
-        except ValueError:
-            pass
-        return False
-
     async def _check_data_volume(self) -> None:
         """Alert when *unexplained* traffic stays high.
 
@@ -352,7 +401,10 @@ class NetworkMonitor(BaseMonitor):
                     await self._fire_data_volume(
                         d, rate, held, total[d], trusted[d], unexplained, per_source,
                     )
-        self._snapshot_connections()
+        if self._attribution_needed():
+            self._snapshot_connections()
+        else:
+            self._prev_conn_bytes = {}
         self._prev_net_bytes = {
             "sent": sent_bytes,
             "recv": recv_bytes,

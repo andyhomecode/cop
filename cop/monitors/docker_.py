@@ -19,11 +19,15 @@ class DockerMonitor(BaseMonitor):
         super().__init__(config, baseline, alert_engine)
         self._restart_tracker: dict[str, list[datetime]] = defaultdict(list)
         self._learned_containers: set[str] = set()
+        self._approved_privileged: set[str] = set()
+        self._approved_exec: set[str] = set()
 
     async def run(self) -> None:
         import docker
         import docker.errors
 
+        self._approved_privileged = await self._approved("privileged_container")
+        self._approved_exec = await self._approved("exec_container")
         learned = await self._baseline.get_container_baseline()
         self._learned_containers = {c["name"] for c in learned}
 
@@ -57,6 +61,21 @@ class DockerMonitor(BaseMonitor):
         if name:
             self._learned_containers.add(name)
             await self._baseline.add_container_to_baseline(name, context.get("image", "unknown"))
+
+    async def mark_expected(self, alert) -> str:
+        name = alert.context.get("name", "")
+        if alert.rule_id == "docker_unknown_container":
+            await self.learn_one(alert.context)
+            return f"✅ Container {name} added to the baseline."
+        if alert.rule_id == "docker_privileged_container" and name:
+            await self._baseline.add_approval("privileged_container", name)
+            self._approved_privileged.add(name)
+            return f"✅ {name} may run privileged; it won't alert again."
+        if alert.rule_id == "docker_exec_into_container" and name:
+            await self._baseline.add_approval("exec_container", name)
+            self._approved_exec.add(name)
+            return f"✅ docker exec into {name} won't alert again."
+        return await super().mark_expected(alert)
 
     async def learn(self) -> None:
         import docker
@@ -101,7 +120,12 @@ class DockerMonitor(BaseMonitor):
         status = event.get("status", action)
         attrs = event.get("Actor", {}).get("Attributes", {})
         name = attrs.get("name", (event.get("id") or "?")[:12])
-        image = attrs.get("image", "?")
+        # Container events carry the image in attributes; image events (pull)
+        # carry it as the actor ID / name.
+        image = attrs.get("image") or (
+            attrs.get("name") or event.get("Actor", {}).get("ID") or event.get("id") or "?"
+            if event.get("Type") == "image" else "?"
+        )
 
         if status == "start":
             await self._handle_start(client, name, image)
@@ -128,7 +152,7 @@ class DockerMonitor(BaseMonitor):
 
         try:
             container = client.containers.get(name)
-            if container.attrs.get("HostConfig", {}).get("Privileged"):
+            if container.attrs.get("HostConfig", {}).get("Privileged") and name not in self._approved_privileged:
                 await self._alerts.fire(Alert(
                     rule_id="docker_privileged_container",
                     severity=Severity.CRITICAL,
@@ -148,6 +172,8 @@ class DockerMonitor(BaseMonitor):
         self._restart_tracker[name].append(datetime.now(timezone.utc))
 
     async def _handle_exec(self, name: str, attrs: dict) -> None:
+        if name in self._approved_exec:
+            return
         await self._alerts.fire(Alert(
             rule_id="docker_exec_into_container",
             severity=Severity.WARN,

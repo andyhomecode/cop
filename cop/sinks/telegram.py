@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import html
 import json
 import logging
 import shlex
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from cop.alerts import Severity
+from cop.alerts import Alert, Severity
 from cop.sinks.base import AlertSink
 
 if TYPE_CHECKING:
@@ -39,6 +40,11 @@ def _risk_line(context: dict) -> str:
         emoji = "🤬🤬🤬🤬"
     base = f"🤖{emoji} Risk: {risk}/10"
     return f"{base} — {comment}" if comment else base
+
+
+def _esc(text: str) -> str:
+    """Escape text for Telegram's HTML parse mode (<, >, &)."""
+    return html.escape(str(text), quote=False)
 
 
 def _alert_key(alert: Alert) -> str:
@@ -88,16 +94,23 @@ class TelegramSink(AlertSink):
             return False
         try:
             key = _alert_key(alert)
+            # Stored with the alert, so the buttons still work after a restart
+            # or once the alert has left the in-memory cache (_lookup_alert).
+            alert.context["alert_key"] = key
             self._pending_alerts[key] = alert
-            if len(self._pending_alerts) > 50:
+            if len(self._pending_alerts) > 200:
                 oldest = next(iter(self._pending_alerts))
                 del self._pending_alerts[oldest]
 
             sev_emoji = _SEVERITY_EMOJI.get(alert.severity, "❗")
-            text = f"{sev_emoji} <b>{alert.title}</b>\n\n{alert.message}"
+            # Alert text is escaped: a "<" (e.g. "Parents: bash < sshd") or "&"
+            # made Telegram reject the whole message as bad HTML, losing the alert.
+            text = f"{sev_emoji} <b>{_esc(alert.title)}</b>\n\n{_esc(alert.message)}"
+            plain = f"{sev_emoji} {alert.title}\n\n{alert.message}"
             risk = _risk_line(alert.context)
             if risk:
-                text += f"\n\n{risk}"
+                text += f"\n\n{_esc(risk)}"
+                plain += f"\n\n{risk}"
 
             from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
@@ -106,12 +119,21 @@ class TelegramSink(AlertSink):
                 InlineKeyboardButton("📝 Prompt", callback_data=f"n:{key}"),
                 InlineKeyboardButton("🔍 Details", callback_data=f"d:{key}"),
             ]])
-            await self._app.bot.send_message(
-                chat_id=self._config.chat_id,
-                text=text,
-                parse_mode="HTML",
-                reply_markup=keyboard,
-            )
+            silent = alert.severity.value == "INFO"  # audit trail: no sound or buzz
+            try:
+                await self._app.bot.send_message(
+                    chat_id=self._config.chat_id, text=text, parse_mode="HTML",
+                    reply_markup=keyboard, disable_notification=silent,
+                )
+            except Exception as exc:
+                if "parse" not in str(exc).lower() and "entit" not in str(exc).lower():
+                    raise
+                # Never lose an alert to formatting: resend as plain text
+                logger.warning("Telegram rejected HTML (%s); sending as plain text", exc)
+                await self._app.bot.send_message(
+                    chat_id=self._config.chat_id, text=plain,
+                    reply_markup=keyboard, disable_notification=silent,
+                )
             return True
         except Exception as exc:
             logger.warning("Telegram send failed: %s", exc)
@@ -151,11 +173,11 @@ class TelegramSink(AlertSink):
             return
 
         action, _, key = query.data.partition(":")
-        alert = self._pending_alerts.get(key)
+        alert = await self._lookup_alert(key)
 
         if action == "b":
             if alert is None:
-                await query.edit_message_text("⚠️ Alert expired from memory (cop restarted?).")
+                await query.edit_message_text("⚠️ Alert not found (older than the alert history?).")
                 return
             msg = await self._do_learn_one(alert)
             await query.edit_message_text(msg)
@@ -167,7 +189,7 @@ class TelegramSink(AlertSink):
             self._pending_note[user_id] = alert
             await self._app.bot.send_message(
                 chat_id=self._config.chat_id,
-                text=f"📝 Explain why <b>{alert.title}</b> is benign (this will suppress future false positives):\n<i>e.g. \"was a one-time speedtest\", \"scheduled backup job\"</i>",
+                text=f"📝 Explain why <b>{_esc(alert.title)}</b> is benign (this will suppress future false positives):\n<i>e.g. \"was a one-time speedtest\", \"scheduled backup job\"</i>",
                 parse_mode="HTML",
             )
 
@@ -178,7 +200,7 @@ class TelegramSink(AlertSink):
             ctx_text = json.dumps(alert.context, indent=2, default=str)[:3500]
             await self._app.bot.send_message(
                 chat_id=self._config.chat_id,
-                text=f"<pre>{ctx_text}</pre>",
+                text=f"<pre>{_esc(ctx_text)}</pre>",
                 parse_mode="HTML",
             )
 
@@ -288,23 +310,46 @@ class TelegramSink(AlertSink):
             rc = proc.returncode
             icon = "✅" if rc == 0 else "❌"
             await message.reply_text(
-                f"{icon} <code>{cmd}</code> (exit {rc})\n<pre>{output}</pre>",
+                f"{icon} <code>{_esc(cmd)}</code> (exit {rc})\n<pre>{_esc(output)}</pre>",
                 parse_mode="HTML",
             )
         except Exception as exc:
             logger.warning("exec failed: %s", exc)
             await message.reply_text(f"❌ Error: {exc}")
 
+    async def _lookup_alert(self, key: str) -> Any:
+        alert = self._pending_alerts.get(key)
+        if alert is not None or self._db is None:
+            return alert
+        try:
+            row = await self._db.get_alert_by_key(key)
+        except Exception as exc:
+            logger.warning("Alert lookup failed: %s", exc)
+            return None
+        if row is None:
+            return None
+        from datetime import datetime
+        alert = Alert(
+            rule_id=row["rule_id"],
+            severity=Severity(row["severity"]),
+            title=row["title"],
+            message=row["message"],
+            source_monitor=row["source_monitor"],
+            context=json.loads(row["context_json"] or "{}"),
+            fired_at=datetime.fromisoformat(row["fired_at"]),
+        )
+        self._pending_alerts[key] = alert
+        return alert
+
     async def _do_learn_one(self, alert: Any) -> str:
         monitor = self._monitors.get(alert.source_monitor)
-        if monitor and hasattr(monitor, "learn_one"):
-            try:
-                await monitor.learn_one(alert.context)
-                return "✅ Added to baseline. This alert won't fire again."
-            except Exception as exc:
-                logger.warning("learn_one failed: %s", exc)
-                return f"⚠️ Failed to update baseline: {exc}"
-        return f"⚠️ No learn_one handler for monitor: {alert.source_monitor}"
+        if monitor is None:
+            return f"⚠️ Monitor {alert.source_monitor} isn't running."
+        try:
+            return await monitor.mark_expected(alert)
+        except Exception as exc:
+            logger.warning("mark_expected failed for %s: %s", alert.rule_id, exc)
+            return f"⚠️ Failed to update baseline: {exc}"
 
     async def _append_note(self, alert: Any, note: str) -> None:
         context_path = self._data_dir / "context.md"

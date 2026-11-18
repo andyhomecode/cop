@@ -28,7 +28,9 @@ _SSH_ACCEPT_RE = re.compile(
 _SUDO_RE = re.compile(
     r"sudo:\s+(\S+) : TTY=\S+ ; PWD=\S+ ; USER=(\S+) ; COMMAND=(.+)"
 )
-_NEW_USER_RE = re.compile(r"new user: name=(\S+)")
+# "new user: name=bee, UID=1003, ..." — stop at the comma
+_NEW_USER_RE = re.compile(r"new user: name=([^,\s]+)")
+_DAYS = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
 
 
 class AuthMonitor(BaseMonitor):
@@ -56,6 +58,14 @@ class AuthMonitor(BaseMonitor):
         ip = context.get("ip")
         if ip:
             await self._baseline.add_ssh_source(ip)
+
+    async def mark_expected(self, alert) -> str:
+        if alert.rule_id == "ssh_unknown_source":
+            await self.learn_one(alert.context)
+            return f"✅ {alert.context.get('ip')} is now a known SSH source."
+        if alert.rule_id == "ssh_login_outside_window":
+            return "👍 Acknowledged. Login windows are set in the config (monitors.auth.login_windows)."
+        return await super().mark_expected(alert)
 
     async def learn(self) -> None:
         log_path = self._config.log_path
@@ -143,7 +153,42 @@ class AuthMonitor(BaseMonitor):
                 context={"ip": ip, "user": user, "count": count},
             ))
 
-    async def _handle_ssh_success(self, user: str, ip: str) -> None:
+    def _in_login_window(self, user: str, ip: str, now: datetime) -> bool:
+        for w in self._config.login_windows:
+            if w.get("user", user) != user:
+                continue
+            source = w.get("source")
+            if source:
+                try:
+                    if ipaddress.ip_address(ip) not in ipaddress.ip_network(source, strict=False):
+                        continue
+                except ValueError:
+                    if ip != source:
+                        continue
+            days = [d.lower()[:3] for d in w.get("days", _DAYS)]
+            if _DAYS[now.weekday()] not in days:
+                continue
+            start, end = w.get("hours", [0, 24])
+            if not (start <= now.hour < end):
+                continue
+            return True
+        return False
+
+    async def _handle_ssh_success(self, user: str, ip: str, now: datetime | None = None) -> None:
+        now = now or datetime.now(timezone.utc)
+        if user in self._config.restricted_login_users and not self._in_login_window(user, ip, now):
+            await self._alerts.fire(Alert(
+                rule_id="ssh_login_outside_window",
+                severity=Severity.CRITICAL,
+                title=f"SSH login as {user} from {ip} outside its window",
+                message=(
+                    f"'{user}' logged in over SSH from {ip} at {now:%a %H:%M} UTC, "
+                    f"which matches none of its allowed login windows"
+                ),
+                source_monitor=self.name,
+                context={"user": user, "ip": ip},
+                subject=f"{user}@{ip}",
+            ))
         known = await self._baseline.get_ssh_sources()
         if not self._ip_is_known(ip, known):
             await self._alerts.fire(Alert(

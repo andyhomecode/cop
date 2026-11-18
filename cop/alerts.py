@@ -64,6 +64,27 @@ class Alert:
     source_monitor: str
     context: dict[str, Any] = field(default_factory=dict)
     fired_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    # What this alert is about, for dedup. None = derive it from the context.
+    subject: str | None = None
+
+
+# Context keys that identify what an alert is about, most specific first. Dedup
+# is per (rule_id, subject): two different files, users or ports each alert,
+# while the same one repeating within the cooldown is held back.
+_SUBJECT_KEYS = (
+    "dest_path", "src_path", "path", "local_port", "ip", "module", "package",
+    "username", "name", "image", "direction", "command",
+)
+
+
+def alert_subject(alert: Alert) -> str:
+    if alert.subject is not None:
+        return alert.subject
+    for key in _SUBJECT_KEYS:
+        val = alert.context.get(key)
+        if val not in (None, ""):
+            return f"{key}={val}"
+    return ""
 
 
 class AlertEngine:
@@ -80,39 +101,64 @@ class AlertEngine:
         self._sinks = sinks
         self._scorer = scorer
         self._ollama_config = ollama_config
-        self._last_fired: dict[str, datetime] = {}
+        # (rule_id, subject) -> when it last dispatched / how many repeats held back since
+        self._last_fired: dict[tuple[str, str], datetime] = {}
+        self._suppressed: dict[tuple[str, str], int] = {}
         self._lock = asyncio.Lock()
 
     async def fire(self, alert: Alert) -> bool:
-        """Check dedup, score, apply filters, record to DB, dispatch to sinks. Returns True if dispatched."""
+        """Check dedup, score, apply filters, record to DB, dispatch to sinks. Returns True if dispatched.
+
+        A repeat of the same (rule_id, subject) within the cooldown is only
+        counted, not stored or sent; the next one that goes out says how many
+        were held back. This keeps the DB small and lets a different event of
+        the same rule through.
+        """
         async with self._lock:
             _redact_alert(alert)
-            deduped = self._is_duplicate(alert)
+            key = (alert.rule_id, alert_subject(alert))
+            if self._is_duplicate(key, alert):
+                self._suppressed[key] = self._suppressed.get(key, 0) + 1
+                logger.debug("[dedup] %s %s", alert.rule_id, key[1])
+                return False
+            held = self._suppressed.pop(key, 0)
+            if held:
+                alert.context["repeats_suppressed"] = held
+                alert.message += f"\n(+{held} repeat{'s' if held != 1 else ''} held back since the last alert)"
             sent_ntfy = False
             dispatched = False
-            if not deduped:
-                if self._scorer is not None:
-                    result = await self._scorer.score(alert)
-                    if result is not None:
-                        risk, comment = result
-                        alert.context["ollama_risk"] = risk
-                        alert.context["ollama_comment"] = comment
-                    else:
-                        alert.context["ollama_comment"] = "Ollama Down"
-                self._last_fired[alert.rule_id] = alert.fired_at
-                if self._is_ollama_suppressed(alert):
-                    logger.debug(
-                        "[suppressed] %s — risk=%s %s",
-                        alert.rule_id,
-                        alert.context.get("ollama_risk"),
-                        alert.context.get("ollama_comment", ""),
-                    )
+            if self._scorer is not None:
+                result = await self._scorer.score(alert)
+                if result is not None:
+                    risk, comment = result
+                    alert.context["ollama_risk"] = risk
+                    alert.context["ollama_comment"] = comment
                 else:
-                    sent_ntfy = await self._dispatch(alert)
-                    dispatched = True
-                    logger.info("[%s] %s — %s", alert.severity.value, alert.rule_id, alert.title)
-            await self._record(alert, deduped=deduped, sent_ntfy=sent_ntfy)
+                    alert.context["ollama_comment"] = "Ollama Down"
+            self._last_fired[key] = alert.fired_at
+            self._prune_last_fired(alert.fired_at)
+            if self._is_ollama_suppressed(alert):
+                logger.debug(
+                    "[suppressed] %s — risk=%s %s",
+                    alert.rule_id,
+                    alert.context.get("ollama_risk"),
+                    alert.context.get("ollama_comment", ""),
+                )
+            else:
+                sent_ntfy = await self._dispatch(alert)
+                dispatched = True
+                logger.info("[%s] %s — %s", alert.severity.value, alert.rule_id, alert.title)
+            await self._record(alert, deduped=False, sent_ntfy=sent_ntfy)
             return dispatched
+
+    def _prune_last_fired(self, now: datetime) -> None:
+        if len(self._last_fired) < 5000:
+            return
+        longest = max([self._config.dedup_window_seconds, *self._config.rule_cooldowns.values()])
+        for k, t in list(self._last_fired.items()):
+            if (now - t).total_seconds() >= longest:
+                del self._last_fired[k]
+                self._suppressed.pop(k, None)
 
     def _is_ollama_suppressed(self, alert: Alert) -> bool:
         if self._ollama_config is None or self._scorer is None:
@@ -130,8 +176,8 @@ class AlertEngine:
                 return True
         return False
 
-    def _is_duplicate(self, alert: Alert) -> bool:
-        last = self._last_fired.get(alert.rule_id)
+    def _is_duplicate(self, key: tuple[str, str], alert: Alert) -> bool:
+        last = self._last_fired.get(key)
         if last is None:
             return False
         cooldown = self._cooldown_for(alert.rule_id)

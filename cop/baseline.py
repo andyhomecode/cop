@@ -56,6 +56,17 @@ CREATE TABLE IF NOT EXISTS alert_history (
 );
 
 CREATE INDEX IF NOT EXISTS idx_alert_rule_fired ON alert_history(rule_id, fired_at);
+CREATE INDEX IF NOT EXISTS idx_alert_fired ON alert_history(fired_at);
+
+-- "Mark Expected" approvals that don't fit a baseline table: a file path,
+-- a kernel module, a process allowed sustained CPU, an outbound port, ...
+CREATE TABLE IF NOT EXISTS approvals (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    kind        TEXT NOT NULL,
+    value       TEXT NOT NULL,
+    created_at  TEXT NOT NULL,
+    UNIQUE(kind, value)
+);
 
 CREATE TABLE IF NOT EXISTS ssh_sources (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -95,8 +106,11 @@ class BaselineDB:
         ) as cur:
             return [dict(row) for row in await cur.fetchall()]
 
-    async def set_process_baseline(self, procs: list[dict]) -> None:
-        await self._db.execute("DELETE FROM process_baseline")
+    async def set_process_baseline(self, procs: list[dict], replace: bool = True) -> None:
+        """Store procs as the baseline. replace=False adds to what's there,
+        keeping earlier approvals and processes seen since (cop learn does this)."""
+        if replace:
+            await self._db.execute("DELETE FROM process_baseline")
         now = self._now()
         await self._db.executemany(
             "INSERT OR IGNORE INTO process_baseline(name, exe, username, created_at) VALUES (?,?,?,?)",
@@ -208,6 +222,34 @@ class BaselineDB:
         )
         await self._db.commit()
 
+    # --- approvals ---
+
+    async def add_approval(self, kind: str, value: str) -> None:
+        await self._db.execute(
+            "INSERT OR IGNORE INTO approvals(kind, value, created_at) VALUES (?,?,?)",
+            (kind, value, self._now()),
+        )
+        await self._db.commit()
+
+    async def get_approvals(self, kind: str | None = None) -> list[dict]:
+        sql = "SELECT kind, value, created_at FROM approvals"
+        params: tuple = ()
+        if kind is not None:
+            sql += " WHERE kind=?"
+            params = (kind,)
+        async with self._db.execute(sql + " ORDER BY kind, value", params) as cur:
+            return [dict(row) for row in await cur.fetchall()]
+
+    async def get_alert_by_key(self, key: str) -> dict | None:
+        """An alert sent to Telegram, by the key on its buttons (context.alert_key)."""
+        async with self._db.execute(
+            "SELECT * FROM alert_history WHERE json_extract(context_json, '$.alert_key') = ? "
+            "ORDER BY id DESC LIMIT 1",
+            (key,),
+        ) as cur:
+            row = await cur.fetchone()
+            return dict(row) if row else None
+
     # --- alert history ---
 
     async def record_alert(
@@ -257,6 +299,16 @@ class BaselineDB:
             f"SELECT * FROM alert_history {where} ORDER BY fired_at DESC LIMIT ?", params
         ) as cur:
             return [dict(row) for row in await cur.fetchall()]
+
+    async def prune_alerts(self, retention_days: int) -> int:
+        """Delete alert history older than retention_days. Returns rows deleted."""
+        from datetime import timedelta
+        if retention_days <= 0:
+            return 0
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=retention_days)).isoformat()
+        cur = await self._db.execute("DELETE FROM alert_history WHERE fired_at < ?", (cutoff,))
+        await self._db.commit()
+        return cur.rowcount
 
     async def get_alert_counts(self) -> dict:
         async with self._db.execute(

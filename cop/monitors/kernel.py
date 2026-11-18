@@ -1,12 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-import os
-import re
-import subprocess
-from typing import TYPE_CHECKING, AsyncIterator
-
-import aiofiles
+from typing import TYPE_CHECKING
 
 from cop.alerts import Alert, Severity
 from cop.monitors.base import BaseMonitor
@@ -14,10 +9,22 @@ from cop.monitors.base import BaseMonitor
 if TYPE_CHECKING:
     from cop.config import KernelMonitorConfig
 
-_MODULE_LOADED_RE = re.compile(r": (\S+): module loaded")
+_PROC_MODULES = "/proc/modules"
+
+
+def read_loaded_modules(path: str = _PROC_MODULES) -> set[str]:
+    """Names of currently loaded kernel modules (first field of /proc/modules)."""
+    with open(path) as f:
+        return {line.split(" ", 1)[0] for line in f if line.strip()}
 
 
 class KernelMonitor(BaseMonitor):
+    """Alerts on kernel modules loaded after cop started.
+
+    Polls /proc/modules. (It used to tail kern.log for "module loaded", but only
+    a few drivers print that, e.g. loop, so it missed almost every load.)
+    """
+
     name = "KernelMonitor"
 
     def __init__(self, config: KernelMonitorConfig, baseline, alert_engine):
@@ -25,80 +32,34 @@ class KernelMonitor(BaseMonitor):
         self._known_modules: set[str] = set(config.known_modules)
 
     async def run(self) -> None:
-        await self._seed()
+        self._known_modules.update(read_loaded_modules())
+        self._known_modules |= await self._approved("kernel_module")
         while self._running:
             try:
-                async for line in self._tail_file(self._config.log_path):
-                    if not self._running:
-                        return
-                    await self._handle_line(line)
-            except asyncio.CancelledError:
-                raise
+                await self._check()
             except Exception:
-                self._logger.exception("KernelMonitor error — restarting tail in 5s")
-                await asyncio.sleep(5)
+                self._logger.exception("Error in kernel module scan")
+            await asyncio.sleep(self._config.poll_interval_seconds)
 
     async def learn(self) -> None:
-        await self._seed()
-        self._logger.info("KernelMonitor: seeded %d known modules", len(self._known_modules))
+        self._logger.info("KernelMonitor seeds from /proc/modules at startup — no baseline to learn")
 
-    async def _seed(self) -> None:
-        loop = asyncio.get_event_loop()
-        modules = await loop.run_in_executor(None, self._get_loaded_modules)
-        self._known_modules.update(modules)
-
-    def _get_loaded_modules(self) -> set[str]:
-        try:
-            result = subprocess.run(
-                ["lsmod"], capture_output=True, text=True, timeout=10
-            )
-            modules: set[str] = set()
-            for line in result.stdout.splitlines()[1:]:
-                parts = line.split()
-                if parts:
-                    modules.add(parts[0])
-            return modules
-        except Exception:
-            return set()
-
-    async def _tail_file(self, path: str) -> AsyncIterator[str]:
-        while not os.path.exists(path):
-            self._logger.warning("%s not found — waiting", path)
-            await asyncio.sleep(5)
-            if not self._running:
-                return
-        try:
-            async with aiofiles.open(path, "r", errors="replace") as f:
-                await f.seek(0, 2)
-                current_inode = os.stat(path).st_ino
-                while self._running:
-                    line = await f.readline()
-                    if line:
-                        yield line
-                    else:
-                        try:
-                            if os.stat(path).st_ino != current_inode:
-                                self._logger.info("kern.log rotated, reopening")
-                                return
-                        except FileNotFoundError:
-                            return
-                        await asyncio.sleep(0.5)
-        except PermissionError:
-            self._logger.error("Permission denied: %s — kernel monitor disabled", path)
-
-    async def _handle_line(self, line: str) -> None:
-        m = _MODULE_LOADED_RE.search(line)
-        if not m:
-            return
-        module = m.group(1).rstrip(":")
-        if module in self._known_modules:
-            return
+    async def mark_expected(self, alert) -> str:
+        module = alert.context.get("module")
+        if not module:
+            return await super().mark_expected(alert)
+        await self._baseline.add_approval("kernel_module", module)
         self._known_modules.add(module)
-        await self._alerts.fire(Alert(
-            rule_id="kernel_module_loaded",
-            severity=Severity.CRITICAL,
-            title=f"Unknown kernel module loaded: {module}",
-            message=f"Kernel module '{module}' was loaded and is not in known modules list",
-            source_monitor=self.name,
-            context={"module": module},
-        ))
+        return f"✅ Module {module} approved; it won't alert again, even after a reboot."
+
+    async def _check(self, path: str = _PROC_MODULES) -> None:
+        for module in sorted(read_loaded_modules(path) - self._known_modules):
+            self._known_modules.add(module)
+            await self._alerts.fire(Alert(
+                rule_id="kernel_module_loaded",
+                severity=Severity.CRITICAL,
+                title=f"Unknown kernel module loaded: {module}",
+                message=f"Kernel module '{module}' was loaded and is not in known modules list",
+                source_monitor=self.name,
+                context={"module": module},
+            ))

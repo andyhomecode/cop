@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import glob
 import os
 import pwd
 from pathlib import Path
@@ -31,6 +32,11 @@ class PersistenceMonitor(BaseMonitor):
                 self._logger.exception("Error in persistence scan cycle")
             await asyncio.sleep(30)
 
+    async def mark_expected(self, alert) -> str:
+        return ("👍 Acknowledged. The change is now part of cop's snapshot (re-read from disk at "
+                "every start), so it alerts again only if the file changes again. To ignore a "
+                "unit for good, add it to monitors.persistence.known_units.")
+
     async def learn(self) -> None:
         await self._seed()
         self._logger.info(
@@ -45,12 +51,17 @@ class PersistenceMonitor(BaseMonitor):
             None, self._scan_paths, self._config.cron_paths
         )
         self._known_units = await loop.run_in_executor(
-            None, self._scan_paths, self._config.systemd_paths
+            None, self._scan_paths, self._config.systemd_paths, True
         )
 
-    def _scan_paths(self, paths: list[str]) -> dict[str, float]:
+    def _scan_paths(self, paths: list[str], dropins: bool = False) -> dict[str, float]:
+        """mtime per file in paths (globs allowed). With dropins, also the files
+        in each *.d/ directory (systemd drop-ins: override.conf etc.)."""
         result: dict[str, float] = {}
+        expanded: list[str] = []
         for path_str in paths:
+            expanded.extend(sorted(glob.glob(path_str)) if any(c in path_str for c in "*?[") else [path_str])
+        for path_str in expanded:
             p = Path(path_str)
             if not p.exists():
                 continue
@@ -64,6 +75,10 @@ class PersistenceMonitor(BaseMonitor):
                     for entry in os.scandir(p):
                         if entry.is_file(follow_symlinks=False):
                             result[entry.path] = entry.stat().st_mtime
+                        elif dropins and entry.name.endswith(".d") and entry.is_dir(follow_symlinks=False):
+                            for sub in os.scandir(entry.path):
+                                if sub.is_file(follow_symlinks=False):
+                                    result[sub.path] = sub.stat().st_mtime
                 except PermissionError:
                     self._logger.warning("Permission denied scanning %s", p)
         return result
@@ -100,24 +115,54 @@ class PersistenceMonitor(BaseMonitor):
     async def _scan_systemd(self) -> None:
         loop = asyncio.get_event_loop()
         current = await loop.run_in_executor(
-            None, self._scan_paths, self._config.systemd_paths
+            None, self._scan_paths, self._config.systemd_paths, True
         )
         for path, mtime in current.items():
-            name = Path(path).name
-            if not (name.endswith(".service") or name.endswith(".timer") or name.endswith(".socket")):
-                continue
-            if path not in self._known_units:
-                self._known_units[path] = mtime
-                if name in self._config.known_units:
+            p = Path(path)
+            dropin = p.parent.name.endswith(".d")
+            if dropin:
+                # /etc/systemd/system/foo.service.d/override.conf -> foo.service
+                unit = p.parent.name[:-2]
+                if not p.name.endswith(".conf"):
                     continue
-                owner = self._file_owner(path)
+            else:
+                unit = p.name
+                if not unit.endswith((".service", ".timer", ".socket", ".path")):
+                    continue
+            prev = self._known_units.get(path)
+            self._known_units[path] = mtime
+            if prev == mtime:
+                continue
+            if unit in self._config.known_units:
+                continue
+            owner = self._file_owner(path)
+            ctx = {"path": path, "name": unit, "owner": owner}
+            if prev is None and dropin:
+                await self._alerts.fire(Alert(
+                    rule_id="new_systemd_dropin",
+                    severity=Severity.CRITICAL,
+                    title=f"New systemd drop-in: {unit}/{p.name}",
+                    message=f"New drop-in for {unit} (can change what it runs or as whom): {path}\nOwner: {owner}",
+                    source_monitor=self.name,
+                    context=ctx,
+                ))
+            elif prev is None:
                 await self._alerts.fire(Alert(
                     rule_id="new_systemd_unit",
                     severity=Severity.CRITICAL,
-                    title=f"New systemd unit: {name}",
+                    title=f"New systemd unit: {unit}",
                     message=f"New systemd unit detected: {path}\nOwner: {owner}",
                     source_monitor=self.name,
-                    context={"path": path, "name": name, "owner": owner},
+                    context=ctx,
+                ))
+            else:
+                await self._alerts.fire(Alert(
+                    rule_id="systemd_unit_modified",
+                    severity=Severity.WARN,
+                    title=f"systemd {'drop-in' if dropin else 'unit'} modified: {unit}" + (f"/{p.name}" if dropin else ""),
+                    message=f"Modified: {path}\nOwner: {owner}",
+                    source_monitor=self.name,
+                    context=ctx,
                 ))
 
     def _file_owner(self, path: str) -> str:
